@@ -1,6 +1,6 @@
 {
-    "success": 33,
-    "fail": 1,
-    "total_runs": 33,
-    "avg_latency": 11.286844202966401
+    "success": 48,
+    "fail": 5,
+    "total_runs": 48,
+    "avg_latency": 14.673982391754786
 }

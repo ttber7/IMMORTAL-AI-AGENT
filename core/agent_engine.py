@@ -1,5 +1,7 @@
 import json
 import re
+from duckduckgo_search import DDGS
+from core.local_rag import LocalRAG
 import uuid
 import urllib.request
 import asyncio
@@ -35,48 +37,41 @@ def tool_calculate(expression: str) -> str:
     except Exception as e:
         return f"Lỗi toán học: {e}"
 
-def tool_get_weather(location: str) -> str:
-    """Công cụ lấy thời tiết (Mock)"""
-    return f"Thời tiết tại {location} là 28 độ C."
-
-async def tool_notion_search(query: str) -> str:
-    """Tìm kiếm thông tin trong Workspace Notion"""
+def tool_web_search(query: str) -> str:
+    """Tìm kiếm trên Internet sử dụng DuckDuckGo"""
     try:
-        # Giả lập gọi MCP (Thực tế sẽ gọi mcp_notion-mcp-server_API-post-search)
-        return f"Tìm thấy 3 tài liệu về '{query}' trong Notion."
+        results = DDGS().text(query, max_results=3)
+        formatted_results = []
+        for r in results:
+            formatted_results.append({
+                "title": r.get("title", ""),
+                "snippet": r.get("body", "").replace("\n", " ")[:300]
+            })
+        return json.dumps(formatted_results, ensure_ascii=False)
     except Exception as e:
-        return f"Lỗi Notion: {e}"
+        return f"Lỗi Web Search: {e}"
 
-async def tool_notebook_query(notebook_id: str, query: str) -> str:
-    """Hỏi đáp chuyên sâu về tài liệu trong NotebookLM"""
-    try:
-        # Giả lập gọi MCP (Thực tế sẽ gọi mcp_notebooklm_notebook_query)
-        return f"NotebookLM: Dựa trên tài liệu, '{query}' được giải thích là..."
-    except Exception as e:
-        return f"Lỗi NotebookLM: {e}"
-
-AVAILABLE_TOOLS = {
-    "calculate": tool_calculate,
-    "get_weather": tool_get_weather,
-    "notion_search": tool_notion_search,
-    "notebook_query": tool_notebook_query
-}
+# Không khởi tạo AVAILABLE_TOOLS tĩnh nữa, sẽ gắn vào AgentEngine instance để inject local_rag
 
 SYSTEM_PROMPT = """
 Bạn là THE IMMORTAL AI AGENT.
 
 LỆNH CƯỠNG CHẾ (BẤT BIẾN):
-1. BẠN PHẢI TRẢ VỀ JSON HỢP LỆ. KHÔNG giải thích, KHÔNG chào hỏi, KHÔNG bọc trong markdown.
-2. JSON của bạn PHẢI tuân thủ 1 trong 2 cấu trúc:
+1. BẮT BUỘC TRẢ VỀ JSON HỢP LỆ. KHÔNG giải thích, KHÔNG chào hỏi, KHÔNG bọc trong markdown.
+2. NGÔN NGỮ: BẮT BUỘC SỬ DỤNG TIẾNG VIỆT 100% trong toàn bộ suy luận (thought) và câu trả lời (answer). TUYỆT ĐỐI KHÔNG DÙNG TIẾNG TRUNG.
+3. JSON của bạn PHẢI tuân thủ 1 trong 2 cấu trúc:
    - Trả lời trực tiếp: {"thought": "suy luận", "answer": "nội dung trả lời"}
    - Dùng tool (công cụ): {"thought": "suy luận", "action": "tên_tool", "params": {"tên_tham_số": "giá_trị"}}
-3. TỰ SỬA LỖI: Nếu nhận được thông báo lỗi JSON từ hệ thống, hãy sửa và trả về JSON đúng.
+
+QUY TẮC ƯU TIÊN TÌM KIẾM (QUAN TRỌNG):
+- Nếu câu hỏi về công ty, dự án nội bộ, lịch sử: DÙNG "search_document".
+- Nếu câu hỏi về tin tức thời sự, giá cả, sự kiện hiện tại: DÙNG "web_search".
+- Nếu "search_document" trả về 'Không tìm thấy thông tin', BẮT BUỘC dùng "web_search" để tìm mạng ngoài.
 
 DANH SÁCH CÔNG CỤ (CHỈ DÙNG CÁC CÔNG CỤ NÀY):
 - Tính toán toán học: "calculate" với params {"expression": "ví dụ: 5*3"}
-- Xem thời tiết: "get_weather" với params {"location": "tên thành phố, ví dụ: Sài Gòn"}
-- Tìm ghi chú: "notion_search" với params {"query": "từ khóa tìm kiếm"}
-- Đọc tài liệu: "notebook_query" với params {"notebook_id": "id", "query": "câu hỏi"}
+- Tìm kiếm Internet: "web_search" với params {"query": "từ khóa tìm kiếm"}. LƯU Ý: Luôn tự đọc hiểu và tóm tắt kết quả thành câu trả lời tự nhiên.
+- Đọc tài liệu nội bộ: "search_document" với params {"query": "từ khóa tìm kiếm"}
 """
 
 def extract_json_safe(text: str) -> str:
@@ -88,10 +83,19 @@ def extract_json_safe(text: str) -> str:
     return text[start:end+1]
 
 class AgentEngine:
-    def __init__(self, model_name=None):
+    def __init__(self, model_name=None, local_rag=None):
         self.default_model_name = model_name
         self.model_name = model_name or "llama3.2:3b"
         self.router = AdaptiveRouter()
+        self.local_rag = local_rag
+        
+        self.available_tools = {
+            "calculate": tool_calculate,
+            "web_search": tool_web_search
+        }
+        
+        if self.local_rag:
+            self.available_tools["search_document"] = self.local_rag.search
         
         # [INTELLIGENCE LAYER] Metrics Tracker với Persistence
         self.metrics_file = "agent_metrics.json"
@@ -274,7 +278,7 @@ class AgentEngine:
                 
                 if "thought" in ai_json:
                     logger.info(f"🤔 Thought: {ai_json['thought']}")
-                    if callback: callback("THINK", ai_json["thought"])
+                    emit("THINK", ai_json["thought"])
                 
                 # CHẶN ĐƯỜNG TRẢ LỜI (FINAL ANSWER)
                 if "answer" in ai_json:
@@ -294,32 +298,41 @@ class AgentEngine:
                     
                     # [FLOW LAYER] Action Loop Detection
                     action_signature = f"{tool_name}:{json.dumps(params, sort_keys=True)}"
+                    if tool_name.lower() == "answer":
+                        final_text = params.get("answer", str(params))
+                        logger.info(f"✅ FINAL ANSWER (RESCUED): {final_text}")
+                        self.metrics["success"] += 1
+                        self.metrics["total_runs"] += 1
+                        latency = time.time() - start_time
+                        self.metrics["avg_latency"] = (self.metrics["avg_latency"] * (self.metrics["total_runs"]-1) + latency) / self.metrics["total_runs"]
+                        self._save_metrics()
+                        return final_text
                     if action_signature == self.last_action_signature:
                         raise ValueError(f"PHÁT HIỆN VÒNG LẶP HÀNH ĐỘNG: Đừng gọi lại {tool_name} với cùng tham số này!")
                     
                     if action_signature in self.failed_actions:
                         raise ValueError(f"Hành động {tool_name} này đã từng thất bại. Hãy chọn cách khác.")
 
-                    if tool_name not in AVAILABLE_TOOLS:
-                        raise ValueError(f"Công cụ '{tool_name}' không tồn tại trong hệ thống.")
+                    if tool_name not in self.available_tools:
+                        raise ValueError(f"Công cụ '{tool_name}' không tồn tại trong hệ thống. Hãy chọn công cụ khác hoặc tự trả lời (answer).")
 
                     if tool_name == "calculate" and not isinstance(params.get("expression"), str):
                         raise ValueError("Tham số 'expression' của calculate BẮT BUỘC phải là chuỗi (string).")
-                    if tool_name == "get_weather" and not isinstance(params.get("location"), str):
-                        raise ValueError("Tham số 'location' của get_weather BẮT BUỘC phải là chuỗi (string).")
+                    if tool_name in ["web_search", "search_document"] and not isinstance(params.get("query"), str):
+                        raise ValueError(f"Tham số 'query' của {tool_name} BẮT BUỘC phải là chuỗi (string).")
                     
                     self.last_action_signature = action_signature
                     self.current_action = tool_name
                     logger.info(f"🛠️ CALLING TOOL: {tool_name}")
-                    if callback: callback("ACT", f"Gọi công cụ: {tool_name}")
+                    emit("ACT", f"Gọi công cụ: {tool_name}")
                     
-                    tool_func = AVAILABLE_TOOLS[tool_name]
+                    tool_func = self.available_tools[tool_name]
                     try:
                         if asyncio.iscoroutinefunction(tool_func):
                             self.observation = await tool_func(**params)
                         else:
                             self.observation = tool_func(**params)
-                        if callback: callback("OBSERVE", f"Kết quả: {self.observation}")
+                        emit("OBSERVE", f"Kết quả: {self.observation}")
                     except Exception as e:
                         # 🔴 FIX BUG: Ghi nhớ tool lỗi để lần sau AI chừa mặt nó ra
                         self.failed_actions.append(action_signature)
@@ -327,7 +340,14 @@ class AgentEngine:
                     
                     # LƯU VÀO LỊCH SỬ CHÍNH THỨC (STATE)
                     self.messages.append({"role": "assistant", "content": json_str})
-                    self.messages.append({"role": "system", "content": f"Observation: {self.observation}"})
+                    
+                    # [NÂNG CẤP]: Đổi role thành user và ép nó phải 'answer'
+                    prompt_hinh_phat = (
+                        f"KẾT QUẢ TỪ CÔNG CỤ:\n{self.observation}\n\n"
+                        "-> HÃY ĐỌC KẾT QUẢ TRÊN VÀ TRẢ LỜI NGƯỜI DÙNG BẰNG KEY 'answer'. "
+                        "TUYỆT ĐỐI KHÔNG GỌI LẠI CÔNG CỤ NỮA!"
+                    )
+                    self.messages.append({"role": "user", "content": prompt_hinh_phat})
                     
                     # 🔴 FIX MEMORY: Sliding Window Context (Giới hạn 10 tin nhắn)
                     MAX_HISTORY = 10
@@ -359,7 +379,13 @@ class AgentEngine:
                 emit("REPAIR", str(e))
                 
                 # Bơm thẳng lời nhắc lỗi vào self.messages NHƯNG ĐÁNH DẤU NÓ LÀ TEMP
-                repair_prompt = f"LỖI ĐỊNH DẠNG: {e}. HÃY TRẢ VỀ JSON CHUẨN CÓ KEY 'answer' HOẶC 'action'."
+                if "VÒNG LẶP" in str(e) or "thất bại" in str(e):
+                    # Nếu đang kẹt vòng lặp, ép nó phải trả lời hoặc tìm cách khác
+                    repair_prompt = f"LỖI: {e}. BẠN PHẢI DÙNG KEY 'answer' ĐỂ TỔNG HỢP DỮ LIỆU ĐÃ CÓ."
+                else:
+                    # Nếu lỗi JSON thông thường
+                    repair_prompt = f"LỖI ĐỊNH DẠNG: {e}. HÃY TRẢ VỀ JSON CHUẨN CÓ KEY 'answer' HOẶC 'action'."
+                    
                 self.messages.append({"role": "user", "content": repair_prompt, "is_temp": True})
                 
                 # [FIX]: Dùng while loop giúp iteration -= 1 hoặc không tăng iteration có tác dụng.

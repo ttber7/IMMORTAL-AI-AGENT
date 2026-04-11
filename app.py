@@ -3,6 +3,7 @@ import asyncio
 import json
 from core.agent_engine import AgentEngine
 from core.resource_monitor import monitor
+from core.local_rag import LocalRAG
 
 st.set_page_config(
     page_title="THE IMMORTAL AI - Command Center",
@@ -32,9 +33,27 @@ if "base_model" not in st.session_state: st.session_state.base_model = "llama3.2
 # [RESOURCE LAYER]: Tối ưu VRAM cấp độ Enterprise (Chống rò rỉ bộ nhớ)
 # ==========================================
 @st.cache_resource
+def get_embedder_cache():
+    """Khởi tạo mô hình nhúng văn bản (Cache lớp 1)"""
+    embedder = LocalRAG.initialize_embedder()
+    # [PRE-WARM HACK]: Khởi động model ngay lập tức để nạp vào RAM
+    embedder.encode(["hello"])
+    return embedder
+
+@st.cache_resource
+def get_vector_store_cache(_embedder):
+    """Khởi tạo FAISS Vector Store (Cache lớp 2)"""
+    return LocalRAG.initialize_vector_store(_embedder)
+
+@st.cache_resource
 def get_engine_cache():
-    """Khởi tạo một Dictionary duy nhất để quản lý Engine"""
+    """Khởi tạo một Dictionary duy nhất để quản lý Engine (Cache lớp 3)"""
     return {} # Trả về một từ điển trống
+
+# Khởi tạo LocalRAG Instance an toàn với Cache
+embedder = get_embedder_cache()
+vector_store, chunks = get_vector_store_cache(embedder)
+local_rag = LocalRAG(embedder=embedder, vector_store=vector_store, chunks=chunks)
 
 # Lấy từ điển quản lý Engine
 engine_manager = get_engine_cache()
@@ -48,7 +67,7 @@ if current_model not in engine_manager:
     engine_manager.clear() 
     
     print(f"\n[SYSTEM] [INITIALIZING] AgentEngine with {current_model}...\n")
-    engine_manager[current_model] = AgentEngine(model_name=current_model)
+    engine_manager[current_model] = AgentEngine(model_name=current_model, local_rag=local_rag)
 
 # Lấy Engine ra để sử dụng
 engine = engine_manager[current_model]
