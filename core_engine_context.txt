@@ -1,0 +1,509 @@
+﻿import json
+import re
+import uuid
+import urllib.request
+import asyncio
+import logging
+import os
+from typing import List, Dict, Any
+
+from core.gateway import gateway_entry
+from core.adaptive_router import AdaptiveRouter
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+# === IMPROVED AGENT ENGINE (PRODUCTION GRADE) ===
+# 1. extract_json_safe: DÃ¹ng find/rfind thay regex dá»ƒ trÃ­ch xuáº¥t JSON Ä‘a táº§ng.
+# 2. Cool-down Temp: Lá»—i cÃ ng nhiá»u -> nhiá»‡t Ä‘á»™ cÃ ng giáº£m vá» 0 (Ä‘á»ƒ Ã©p AI chÃ­nh xÃ¡c).
+# 3. Schema Validation: Check sÃ¢u action/params vÃ  tool registry.
+# 4. State Reset: XÃ³a dáº¥u váº¿t request cÅ© á»Ÿ Ä‘áº§u run().
+# 5. Circuit Breaker: PhÃ¢n loáº¡i lá»—i máº¡ng, JSON, vÃ  Tool riÃªng biá»‡t.
+# 6. Structured Output: Táº­n dá»¥ng format: json schema cá»§a Ollama.
+
+# Danh sÃ¡ch Ä‘Äƒng kÃ½ Tool (Tool Registry)
+def tool_calculate(expression: str) -> str:
+    """CÃ´ng cá»¥ thá»±c thi phÃ©p toÃ¡n cÆ¡ báº£n"""
+    if not re.match(r'^[\d\+\-\*\/\.\(\)\s]+$', expression):
+        return "Lá»—i báº£o máº­t: Biá»ƒu thá»©c toÃ¡n há»c chá»©a kÃ½ tá»± khÃ´ng há»£p lá»‡."
+    try:
+        result = eval(expression, {"__builtins__": None}, {})
+        return f"Káº¿t quáº£: {result}"
+    except Exception as e:
+        return f"Lá»—i toÃ¡n há»c: {e}"
+
+def tool_get_weather(location: str) -> str:
+    """CÃ´ng cá»¥ láº¥y thá»i tiáº¿t (Mock)"""
+    return f"Thá»i tiáº¿t táº¡i {location} lÃ  28 Ä‘á»™ C."
+
+async def tool_notion_search(query: str) -> str:
+    """TÃ¬m kiáº¿m thÃ´ng tin trong Workspace Notion"""
+    try:
+        # Giáº£ láº­p gá»i MCP (Thá»±c táº¿ sáº½ gá»i mcp_notion-mcp-server_API-post-search)
+        return f"TÃ¬m tháº¥y 3 tÃ i liá»‡u vá» '{query}' trong Notion."
+    except Exception as e:
+        return f"Lá»—i Notion: {e}"
+
+async def tool_notebook_query(notebook_id: str, query: str) -> str:
+    """Há»i Ä‘Ã¡p chuyÃªn sÃ¢u vá» tÃ i liá»‡u trong NotebookLM"""
+    try:
+        # Giáº£ láº­p gá»i MCP (Thá»±c táº¿ sáº½ gá»i mcp_notebooklm_notebook_query)
+        return f"NotebookLM: Dá»±a trÃªn tÃ i liá»‡u, '{query}' Ä‘Æ°á»£c giáº£i thÃ­ch lÃ ..."
+    except Exception as e:
+        return f"Lá»—i NotebookLM: {e}"
+
+AVAILABLE_TOOLS = {
+    "calculate": tool_calculate,
+    "get_weather": tool_get_weather,
+    "notion_search": tool_notion_search,
+    "notebook_query": tool_notebook_query
+}
+
+SYSTEM_PROMPT = """
+Báº¡n lÃ  THE IMMORTAL AI AGENT.
+
+Lá»†NH CÆ¯á» NG CHáº¾ (Báº¤T BIáº¾N):
+1. Báº N PHáº¢I TRáº¢ Vá»€ JSON Há»¢P Lá»†. KHÃ”NG giáº£i thÃ­ch, KHÃ”NG chÃ o há»i, KHÃ”NG bá»c trong markdown.
+2. JSON cá»§a báº¡n PHáº¢I tuÃ¢n thá»§ 1 trong 2 cáº¥u trÃºc:
+   - Tráº£ lá»i: {"thought": "suy luáº­n", "answer": "ná»™i dung"}
+   - DÃ¹ng tool: {"thought": "suy luáº­n", "action": "tÃªn_tool", "params": {...}}
+3. Tá»° Sá»¬A Lá»–I: Náº¿u nháº­n Ä‘Æ°á»£c thÃ´ng bÃ¡o lá»—i JSON tá»« há»‡ thá»‘ng, hÃ£y phÃ¢n tÃ­ch lá»—i vÃ  tráº£ vá» báº£n JSON Ä‘Ã£ sá»­a Ä‘Ãºng format.
+4. THá»°C Dá»¤NG: Náº¿u Ä‘Ã£ Ä‘á»§ thÃ´ng tin, hÃ£y tráº£ lá»i ngay báº±ng 'answer'.
+
+CÃ”NG Cá»¤:
+- "calculate": {"expression": "..."}
+- "get_weather": {"location": "..."}
+- "notion_search": {"query": "..."}
+- "notebook_query": {"notebook_id": "...", "query": "..."}
+"""
+
+def extract_json_safe(text: str) -> str:
+    """TrÃ­ch xuáº¥t JSON an toÃ n báº±ng cÃ¡ch tÃ¬m block { } ngoÃ i cÃ¹ng"""
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1:
+         raise ValueError("LLM_NO_JSON_FOUND: KhÃ´ng tÃ¬m tháº¥y block JSON trong pháº£n há»“i.")
+    return text[start:end+1]
+
+class AgentEngine:
+    def __init__(self, model_name=None):
+        self.default_model_name = model_name
+        self.model_name = model_name or "llama3.2:3b"
+        self.router = AdaptiveRouter()
+        
+        # [INTELLIGENCE LAYER] Metrics Tracker vá»›i Persistence
+        self.metrics_file = "agent_metrics.json"
+        self.metrics = self._load_metrics()
+        
+        # Internal State
+        self.current_action = None
+        self.observation = None
+        self.failed_actions = [] 
+        self.last_action_signature = None
+        self.circuit_breaker = {"network": 0, "json": 0, "tool": 0}
+
+    def _load_metrics(self) -> Dict[str, Any]:
+        """Táº£i Metrics tá»« file JSON"""
+        default_metrics = {"success": 0, "fail": 0, "total_runs": 0, "avg_latency": 0.0}
+        try:
+            if os.path.exists(self.metrics_file):
+                with open(self.metrics_file, "r") as f:
+                    data = json.load(f)
+                    return {**default_metrics, **data}
+        except Exception as e:
+            logger.error(f"Lá»—i khi náº¡p metrics: {e}")
+        return default_metrics
+
+    def _save_metrics(self):
+        """LÆ°u Metrics xuá»‘ng file JSON"""
+        try:
+            with open(self.metrics_file, "w") as f:
+                json.dump(self.metrics, f, indent=4)
+            logger.info("ðŸ“Š METRICS UPDATED: ÄÃ£ lÆ°u bá»™ chá»‰ sá»‘ hiá»‡u nÄƒng.")
+        except Exception as e:
+            logger.error(f"Lá»—i khi lÆ°u metrics: {e}")
+
+    async def _call_llm(self, prompt: str, temperature: float = 0.2, is_retry: bool = False) -> str:
+        """HÃ m bá»c gá»i Ollama LLM vá»›i Báº¢NG PHONG THáº¦N: Dynamic VRAM & Dual-Layer Timeout"""
+        
+        # [RESOURCE LAYER] Láº¥y tham sá»‘ Ä‘á»™ng dá»±a trÃªn VRAM thá»±c táº¿
+        dynamic_opts = self.router.get_dynamic_params(is_retry=is_retry)
+        dynamic_opts["temperature"] = temperature
+        
+        data = {
+            "model": self.model_name,
+            "system": SYSTEM_PROMPT,
+            "prompt": prompt,
+            "stream": False,
+            "format": {
+                "type": "object",
+                "properties": {
+                    "thought": {"type": "string"},
+                    "answer": {"type": "string"},
+                    "action": {"type": "string"},
+                    "params": {"type": "object"}
+                },
+                "required": ["thought"]
+            },
+            "options": dynamic_opts
+        }
+        
+        def run_sync():
+            try:
+                req = urllib.request.Request(OLLAMA_URL, json.dumps(data).encode('utf-8'))
+                req.add_header('Content-Type', 'application/json')
+                
+                # Lá»›p 1: Socket Timeout (55s)
+                with urllib.request.urlopen(req, timeout=55.0) as response:
+                    result = json.loads(response.read().decode())
+                    return result.get("response", "")
+            except Exception as e:
+                logger.error(f"Socket/Urllib Error: {e}")
+                return "SOCKET_TIMEOUT_OR_ERROR"
+        
+        # Lá»›p 2: Asyncio Timeout (60s)
+        try:
+            async with asyncio.timeout(60.0):
+                result_text = await asyncio.to_thread(run_sync)
+                if result_text == "SOCKET_TIMEOUT_OR_ERROR":
+                    raise TimeoutError("Lá»—i káº¿t ná»‘i váº­t lÃ½ tá»›i Ollama")
+                return result_text
+        except TimeoutError:
+            self.circuit_breaker["network"] += 1
+            logger.error(f"Network Timeout ({self.circuit_breaker['network']})")
+            return "NETWORK_TIMEOUT"
+
+    async def run(self, user_input: str, max_iterations=5):
+        """VÃ²ng láº·p Agent chuáº©n sáº£n xuáº¥t vá»›i Báº¢NG PHONG THáº¦N"""
+        import time
+        start_time = time.time()
+        
+        self.current_action = None
+        self.observation = None
+        self.failed_actions = []
+        self.last_action_signature = None
+        self.circuit_breaker = {"network": 0, "json": 0, "tool": 0}
+        logger.info(f"--- NEW RUN: {user_input} ---")
+        
+        current_temp = 0.2
+        self.messages = [{"role": "user", "content": user_input}]
+        
+        iteration = 1
+        retry_count = 0
+        network_retries = 0
+
+        # [ROUTER LAYER] KÃ­ch hoáº¡t nÃ£o bá»™ phÃ¢n luá»“ng
+        selected_model = self.router.route_task(user_input)
+        if selected_model == "REJECT_TASK":
+            self.metrics["fail"] += 1
+            return "Task bá»‹ tá»« chá»‘i do há»‡ thá»‘ng Ä‘ang cáº¡n kiá»‡t VRAM. Vui lÃ²ng thá»­ láº¡i sau."
+        self.model_name = selected_model
+        
+        while iteration <= max_iterations:
+            # [FIX IMMUTABLE STATE]: XÃ³a cÃ¡c tin nháº¯n nháº¯c lá»—i cá»§a vÃ²ng trÆ°á»›c Ä‘á»ƒ Context luÃ´n sáº¡ch
+            if retry_count == 0:
+                self.messages = [m for m in self.messages if not m.get("is_temp", False)]
+            if self.circuit_breaker["network"] > 5 or self.circuit_breaker["json"] > 5:
+                self.metrics["fail"] += 1
+                return "Há»‡ thá»‘ng tá»± ngáº¯t (Circuit Breaker) do quÃ¡ nhiá»u lá»—i liÃªn tiáº¿p."
+
+            # ðŸ”¥ THE ULTIMATUM: ChÃ¨n Prompt cÆ°á»¡ng cháº¿ á»Ÿ lÆ°á»£t cuá»‘i
+            if iteration == max_iterations:
+                logger.warning("âš ï¸ KÃ­ch hoáº¡t FORCE FINAL ANSWER: Ã‰p LLM chá»‘t háº¡!")
+                # [FLOW LAYER] Gá»­i lá»i nháº¯c trá»±c diá»‡n vÃ o lÆ°á»£t cuá»‘i
+                self.messages.append({
+                    "role": "user", 
+                    "content": "ÄÃ‚Y LÃ€ LÆ¯á»¢T CUá»I CÃ™NG. Báº N Báº®T BUá»˜C PHáº¢I TRáº¢ Lá»œI NGÆ¯á»œI DÃ™NG. HÃ£y xuáº¥t JSON vá»›i duy nháº¥t key 'answer' chá»©a ná»™i dung tráº£ lá»i."
+                })
+
+            print(f"ðŸ”„ VÃ²ng láº·p {iteration}/{max_iterations} (Temp: {current_temp:.1f})...")
+            
+            # [INTELLIGENCE LAYER] Immutable State
+            # Máº·c Ä‘á»‹nh dÃ¹ng history sáº¡ch tá»« self.messages
+            current_prompt = "\n".join([f"{m['role']}: {m['content']}" for m in self.messages])
+            
+            async def task_wrapper(u_input, task_id, trace_id):
+                # is_retry = True náº¿u Ä‘ang á»Ÿ vÃ²ng láº·p sau hoáº·c vá»«a gáº·p lá»—i Ä‘á»‹nh dáº¡ng
+                res = await self._call_llm(u_input["prompt"], temperature=u_input["temperature"], is_retry=(iteration > 1 or retry_count > 0))
+                return {"status": "success", "data": res}
+
+            try:
+                gateway_res = await gateway_entry(
+                    {"prompt": current_prompt, "temperature": current_temp}, 
+                    task_wrapper
+                )
+                raw_response = gateway_res.get("data", "")
+                
+                if not raw_response or raw_response == "NETWORK_TIMEOUT":
+                    network_retries += 1
+                    if network_retries > 3:
+                        self.metrics["fail"] += 1
+                        return "Lá»—i káº¿t ná»‘i máº¡ng nghiÃªm trá»ng. Vui lÃ²ng kiá»ƒm tra láº¡i há»‡ thá»‘ng."
+                    
+                    logger.warning(f"Lá»—i máº¡ng/Timeout láº§n {network_retries}. Äang thá»­ láº¡i...")
+                    await asyncio.sleep(2 ** network_retries) # Exponential Backoff (2s, 4s, 8s)
+                    continue # Bá» qua logic parse JSON bÃªn dÆ°á»›i, quay láº¡i Ä‘áº§u vÃ²ng while gá»i láº¡i LLM
+                logger.info(f"RAW RESPONSE (Iter {iteration}):\n{raw_response}")
+
+                json_str = extract_json_safe(raw_response)
+                ai_json = json.loads(json_str)
+                
+                if "thought" in ai_json:
+                    logger.info(f"ðŸ¤” Thought: {ai_json['thought']}")
+                
+                # CHáº¶N ÄÆ¯á»œNG TRáº¢ Lá»œI (FINAL ANSWER)
+                if "answer" in ai_json:
+                    logger.info(f"âœ… FINAL ANSWER: {ai_json['answer']}")
+                    # Cáº­p nháº­t Metrics
+                    self.metrics["success"] += 1
+                    self.metrics["total_runs"] += 1
+                    latency = time.time() - start_time
+                    self.metrics["avg_latency"] = (self.metrics["avg_latency"] * (self.metrics["total_runs"]-1) + latency) / self.metrics["total_runs"]
+                    self._save_metrics() # LÆ°u vÃ o file
+                    return ai_json["answer"]
+                
+                # CHáº¶N ÄÆ¯á»œNG HÃ€NH Äá»˜NG (ACTION)
+                if "action" in ai_json:
+                    tool_name = ai_json["action"]
+                    params = ai_json.get("params", {})
+                    
+                    # [FLOW LAYER] Action Loop Detection
+                    action_signature = f"{tool_name}:{json.dumps(params, sort_keys=True)}"
+                    if action_signature == self.last_action_signature:
+                        raise ValueError(f"PHÃT HIá»†N VÃ’NG Láº¶P HÃ€NH Äá»˜NG: Äá»«ng gá»i láº¡i {tool_name} vá»›i cÃ¹ng tham sá»‘ nÃ y!")
+                    
+                    if action_signature in self.failed_actions:
+                        raise ValueError(f"HÃ nh Ä‘á»™ng {tool_name} nÃ y Ä‘Ã£ tá»«ng tháº¥t báº¡i. HÃ£y chá»n cÃ¡ch khÃ¡c.")
+
+                    if tool_name not in AVAILABLE_TOOLS:
+                        raise ValueError(f"CÃ´ng cá»¥ '{tool_name}' khÃ´ng tá»“n táº¡i trong há»‡ thá»‘ng.")
+
+                    if tool_name == "calculate" and not isinstance(params.get("expression"), str):
+                        raise ValueError("Tham sá»‘ 'expression' cá»§a calculate Báº®T BUá»˜C pháº£i lÃ  chuá»—i (string).")
+                    if tool_name == "get_weather" and not isinstance(params.get("location"), str):
+                        raise ValueError("Tham sá»‘ 'location' cá»§a get_weather Báº®T BUá»˜C pháº£i lÃ  chuá»—i (string).")
+                    
+                    self.last_action_signature = action_signature
+                    self.current_action = tool_name
+                    logger.info(f"ðŸ› ï¸ CALLING TOOL: {tool_name}")
+                    
+                    tool_func = AVAILABLE_TOOLS[tool_name]
+                    try:
+                        if asyncio.iscoroutinefunction(tool_func):
+                            self.observation = await tool_func(**params)
+                        else:
+                            self.observation = tool_func(**params)
+                    except Exception as e:
+                        # ðŸ”´ FIX BUG: Ghi nhá»› tool lá»—i Ä‘á»ƒ láº§n sau AI chá»«a máº·t nÃ³ ra
+                        self.failed_actions.append(action_signature)
+                        self.observation = f"Lá»–I THá»°C THI TOOL: {str(e)}. HÃƒY TÃŒM CÃCH KHÃC!"
+                    
+                    # LÆ¯U VÃ€O Lá»ŠCH Sá»¬ CHÃNH THá»¨C (STATE)
+                    self.messages.append({"role": "assistant", "content": json_str})
+                    self.messages.append({"role": "system", "content": f"Observation: {self.observation}"})
+                    
+                    # ðŸ”´ FIX MEMORY: Sliding Window Context (Giá»›i háº¡n 10 tin nháº¯n)
+                    MAX_HISTORY = 10
+                    if len(self.messages) > MAX_HISTORY:
+                        # Giá»¯ láº¡i CÃ¢u há»i Ä‘áº§u tiÃªn cá»§a User (thÆ°á»ng lÃ  self.messages[0])
+                        # VÃ€ cáº¯t láº¥y pháº§n Ä‘uÃ´i sao cho tá»•ng sá»‘ message khÃ´ng vÆ°á»£t MAX_HISTORY
+                        # ChÃº Ã½: Cáº§n cáº¯t cháºµn (1 User + 1 Assistant) Ä‘á»ƒ trÃ¡nh Context bá»‹ lá»‡ch
+                        keep_amount = MAX_HISTORY - 1
+                        # Náº¿u pháº§n Ä‘uÃ´i báº¯t Ä‘áº§u báº±ng má»™t cÃ¢u "assistant", lÃ¹i láº¡i 1 bÆ°á»›c Ä‘á»ƒ láº¥y cÃ¢u "user" trÆ°á»›c Ä‘Ã³
+                        if self.messages[-keep_amount]["role"] == "assistant":
+                            keep_amount += 1
+                        
+                        self.messages = [self.messages[0]] + self.messages[-keep_amount:]
+                    
+                    current_temp = 0.2 # Reset nhiá»‡t Ä‘á»™ sau khi cÃ³ thÃ´ng tin má»›i
+                    
+                    # [FLOW LAYER] Tiáº¿n tá»›i bÆ°á»›c tiáº¿p theo vÃ  reset retry_count
+                    iteration += 1
+                    retry_count = 0
+                    continue
+
+                raise ValueError("JSON pháº£n há»“i khÃ´ng chá»©a 'answer' hoáº·c 'action'.")
+
+            except (ValueError, json.JSONDecodeError) as e:
+                self.circuit_breaker["json"] += 1
+                current_temp = max(0.0, current_temp - 0.1)
+                
+                logger.warning(f"âš ï¸ Trigger Self-Repair: {e}")
+                
+                # BÆ¡m tháº³ng lá»i nháº¯c lá»—i vÃ o self.messages NHÆ¯NG ÄÃNH Dáº¤U NÃ“ LÃ€ TEMP
+                repair_prompt = f"Lá»–I Äá»ŠNH Dáº NG: {e}. HÃƒY TRáº¢ Vá»€ JSON CHUáº¨N CÃ“ KEY 'answer' HOáº¶C 'action'."
+                self.messages.append({"role": "user", "content": repair_prompt, "is_temp": True})
+                
+                # [FIX]: DÃ¹ng while loop giÃºp iteration -= 1 hoáº·c khÃ´ng tÄƒng iteration cÃ³ tÃ¡c dá»¥ng.
+                # Tuy nhiÃªn, ta dÃ¹ng retry_count Ä‘á»ƒ giá»›i háº¡n sá»‘ láº§n sá»­a lá»—i cho má»—i bÆ°á»›c.
+                retry_count += 1
+                if retry_count > 3:
+                    logger.error(f"âŒ QuÃ¡ 3 láº§n sá»­a lá»—i JSON á»Ÿ bÆ°á»›c {iteration}. Cháº¥p nháº­n bá» qua vÃ  tiáº¿n tá»›i bÆ°á»›c tiáº¿p theo.")
+                    iteration += 1
+                    retry_count = 0
+                
+                continue
+            
+        print("âŒ QuÃ¡ sá»‘ lÆ°á»£t láº·p (Max Iterations), báº¯t buá»™c dá»«ng Agent láº¡i Ä‘á»ƒ chá»‘ng láº·p vÄ©nh viá»…n!")
+        logger.error("âŒ QuÃ¡ sá»‘ lÆ°á»£t láº·p (Max Iterations). Agent khÃ´ng thá»ƒ Ä‘Æ°a ra Ä‘Ã¡p Ã¡n cuá»‘i cÃ¹ng.")
+        self.metrics["fail"] += 1
+        return "TÃ´i khÃ´ng thá»ƒ hoÃ n thÃ nh yÃªu cáº§u vá»›i cÃ¡c thÃ´ng tin vÃ  cÃ´ng cá»¥ hiá»‡n táº¡i. Vui lÃ²ng cung cáº¥p thÃªm chi tiáº¿t hoáº·c thá»­ láº¡i."
+
+# === Test nhanh tÃ­ch há»£p liá»n tay ===
+if __name__ == "__main__":
+    async def main():
+        engine = AgentEngine(model_name="phi3:mini")
+        
+        # Test 1: Chat bÃ¬nh thÆ°á»ng
+        # await engine.run("ChÃ o báº¡n, báº¡n lÃ  ai vÃ  do ai táº¡o ra?")
+        
+        # Test 2: YÃªu cáº§u tÃ­nh toÃ¡n (Báº¯t buá»™c chui qua Tool)
+        await engine.run("TÃ­nh giÃºp tÃ´i 1245 + 5600 báº±ng bao nhiÃªu háº£ AI?")
+        
+    asyncio.run(main())
+
+import os
+
+# Cáº§n cÃ i Ä‘áº·t: pip install pynvml
+try:
+    import pynvml
+except ImportError:
+    print("Vui lÃ²ng cÃ i Ä‘áº·t thÆ° viá»‡n quáº£n lÃ½ GPU: pip install nvidia-ml-py")
+
+class AdaptiveRouter:
+    def __init__(self):
+        self.vram_threshold_mb = 1500  # NgÆ°á»¡ng tá»‘i thiá»ƒu Ä‘á»ƒ cháº¡y model 8B
+        self.default_model = "llama3.2:3b"  # [ERR-1 FIX] phi3:mini hallucinate -> dÃ¹ng llama3.2:3b
+        try:
+            pynvml.nvmlInit()
+            self.gpu_available = True
+        except Exception as e:
+            self.gpu_available = False
+            print("âš ï¸ KhÃ´ng tÃ¬m tháº¥y GPU NVIDIA hoáº·c Driver. Cháº¿ Ä‘á»™ cháº¡y CPU.")
+            
+    def __del__(self):
+        """Destructor Ä‘á»ƒ trÃ¡nh NVML Memory Leak"""
+        if self.gpu_available:
+            try:
+                pynvml.nvmlShutdown()
+            except:
+                pass
+
+    def get_free_vram(self):
+        if not self.gpu_available:
+            return 0
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0) # Card Quadro T2000 (Index 0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return info.free / 1024**2  # Chuyá»ƒn sang MiB
+
+    def analyze_complexity(self, user_input: str) -> dict:
+        """
+        Scoring System (Heuristic) Ä‘á»ƒ Ä‘Ã¡nh giÃ¡ Ä‘á»™ phá»©c táº¡p trÃ¡nh gá»i LLM phÃ¢n loáº¡i tá»‘n VRAM.
+        Tráº£ vá» dict chá»©a task_type vÃ  Ä‘iá»ƒm sá»‘.
+        """
+        score: int = 0
+        user_input_lower = user_input.lower()
+        
+        # 1. PhÃ¡t hiá»‡n Tool Task (Mock)
+        tool_keywords = ["tÃ­nh", "+", "-", "*", "/", "thá»i tiáº¿t"]
+        if any(kw in user_input_lower for kw in tool_keywords):
+            return {"task_type": "tool", "score": score}
+        
+        # 2. Cháº¥m Ä‘iá»ƒm theo Ä‘á»™ dÃ i
+        words = len(user_input.split())
+        if words > 100:
+            score += 3
+        elif words > 40:
+            score += 1
+            
+        # 2. Cháº¥m Ä‘iá»ƒm theo Keyword tÆ° duy (Reasoning)
+        reasoning_keywords = ["phÃ¢n tÃ­ch", "so sÃ¡nh", "tá»•ng há»£p", "Ä‘Ã¡nh giÃ¡", "táº¡i sao", "káº¿ hoáº¡ch"]
+        for kw in reasoning_keywords:
+            if kw in user_input_lower:
+                score += 2
+                
+        # 3. PhÃ¢n loáº¡i Code (Coding Task)
+        coding_keywords = ["code", "láº­p trÃ¬nh", "python", "javascript", "html", "thuáº­t toÃ¡n", "bug"]
+        is_coding = any(kw in user_input_lower for kw in coding_keywords)
+        
+        # Quyáº¿t Ä‘á»‹nh Task Type
+        if is_coding:
+            return {"task_type": "code", "score": score}
+        elif score >= 3:
+            return {"task_type": "reasoning", "score": score}
+        else:
+            return {"task_type": "fast", "score": score}
+
+    def route_task(self, user_input: str):
+        """
+        Quyáº¿t Ä‘á»‹nh dÃ¹ng model dá»±a trÃªn há»‡ thá»‘ng Ä‘iá»ƒm ngáº§m vÃ  VRAM thá»±c táº¿.
+        """
+        free_vram = self.get_free_vram()
+        print(f"ðŸ“Š [ROUTER] VRAM CPU Check: {free_vram:.2f} MiB")
+
+        if free_vram < 800 and self.gpu_available:
+            print("ðŸš¨ [CRITICAL] VRAM quÃ¡ tháº¥p! Tráº£ vá» tráº¡ng thÃ¡i REJECT_TASK Ä‘á»ƒ báº£o vá»‡ T2000.")
+            return "REJECT_TASK" 
+
+        # 1. Cháº¥m Ä‘iá»ƒm cÃ¢u há»i
+        analysis = self.analyze_complexity(user_input)
+        print(f"âš–ï¸ [ROUTER] PhÃ¢n tÃ­ch: Loáº¡i Task={analysis['task_type']}, Äiá»ƒm KhÃ³={analysis['score']}")
+
+        # 2. Multi-model strategy (Khung logic cÃ³ sáºµn, nhÆ°ng Æ°u tiÃªn card 4GB hiá»‡n táº¡i)
+        if analysis["task_type"] == "code":
+            # Náº¿u mÃ¡y xá»‹n cÃ³ thá»ƒ dÃ¹ng codellama, nhÆ°ng á»Ÿ T2000 ta map qua llama3 hoáº·c phi3
+            target_model = "llama3:8b" if free_vram > self.vram_threshold_mb else self.default_model
+            print(f"ðŸ’» Task Láº­p trÃ¬nh (YÃªu cáº§u Coder) -> Äá»‹nh tuyáº¿n: {target_model}")
+            return target_model
+            
+        elif analysis["task_type"] == "reasoning":
+            # Task suy luáº­n sÃ¢u (cÃ³ thá»ƒ map mistral)
+            target_model = "llama3:8b" if free_vram > self.vram_threshold_mb else self.default_model
+            print(f"ðŸ§  Task Suy luáº­n sÃ¢u (Score {analysis['score']}) -> Äá»‹nh tuyáº¿n: {target_model}")
+            return target_model
+            
+        elif analysis["task_type"] == "tool":
+            print(f"ðŸ› ï¸ Task CÃ´ng cá»¥ (TÃ­nh toÃ¡n/Thá»i tiáº¿t) -> Äá»‹nh tuyáº¿n: {self.default_model} (Tiáº¿t kiá»‡m VRAM)")
+            return self.default_model
+            
+        else:
+            print(f"âš¡ Task Giao tiáº¿p nhanh/ÄÆ¡n giáº£n -> Äá»‹nh tuyáº¿n: {self.default_model}")
+            return self.default_model
+
+    def get_dynamic_params(self, is_retry: bool = False) -> dict:
+        free_vram = self.get_free_vram()
+        
+        # Äáº£m báº£o dÃ¹ng Ä‘Ãºng tÃªn biáº¿n chá»©a tÃªn model cá»§a AdaptiveRouter
+        model_name = getattr(self, "model_name", getattr(self, "default_model", "llama3.2:3b"))
+        base_layers = 32 if "phi3" in model_name else 28
+
+        # Máº·c Ä‘á»‹nh (Tráº¡ng thÃ¡i lÃ½ tÆ°á»Ÿng)
+        num_gpu = base_layers
+        num_predict = 300
+
+        # ðŸ›¡ï¸ Báº¢O Vá»† KÃ‰P: Háº¡ GPU náº¿u VRAM tháº¥p HOáº¶C Ä‘ang pháº£i Retry (cá»©u há»™)
+        if free_vram < 1200 or is_retry:
+            num_gpu = max(16, base_layers - 4)
+            print(f"ðŸ“‰ Báº£o vá»‡ VRAM (Free: {free_vram:.1f}MB, Retry: {is_retry}) -> Ã‰p GPU layers xuá»‘ng: {num_gpu}")
+
+        # âœ‚ï¸ Cáº®T GIáº¢M TOKEN: Ã‰p AI tráº£ lá»i ngáº¯n gá»n khi Ä‘ang sá»­a lá»—i
+        if is_retry:
+            num_predict = 150 # Siáº¿t cháº·t hÆ¡n má»™t chÃºt (150 thay vÃ¬ 200) Ä‘á»ƒ chá»‘ng áº£o giÃ¡c tuyá»‡t Ä‘á»‘i
+            print(f"ðŸ” Retry Mode -> Ã‰p num_predict xuá»‘ng: {num_predict}")
+
+        return {
+            "num_gpu": num_gpu,
+            "num_predict": num_predict,
+            "num_ctx": 2048,
+            "num_thread": 4,
+            "low_vram": True
+        }
+
+# --- VÃ Dá»¤ TÃCH Há»¢P ---
+if __name__ == "__main__":
+    router = AdaptiveRouter()
+    # Giáº£ láº­p task nghiÃªn cá»©u chuyÃªn sÃ¢u vá» code
+    target_model = router.route_task("Viáº¿t code python tá»•ng há»£p vÃ  phÃ¢n tÃ­ch dá»¯ liá»‡u")
+    print(f"ðŸš€ Model Ä‘Æ°á»£c chá»n: {target_model}")

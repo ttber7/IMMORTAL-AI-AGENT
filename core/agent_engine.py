@@ -13,6 +13,7 @@ from core.adaptive_router import AdaptiveRouter
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 # === IMPROVED AGENT ENGINE (PRODUCTION GRADE) ===
@@ -67,16 +68,15 @@ Bạn là THE IMMORTAL AI AGENT.
 LỆNH CƯỠNG CHẾ (BẤT BIẾN):
 1. BẠN PHẢI TRẢ VỀ JSON HỢP LỆ. KHÔNG giải thích, KHÔNG chào hỏi, KHÔNG bọc trong markdown.
 2. JSON của bạn PHẢI tuân thủ 1 trong 2 cấu trúc:
-   - Trả lời: {"thought": "suy luận", "answer": "nội dung"}
-   - Dùng tool: {"thought": "suy luận", "action": "tên_tool", "params": {...}}
-3. TỰ SỬA LỖI: Nếu nhận được thông báo lỗi JSON từ hệ thống, hãy phân tích lỗi và trả về bản JSON đã sửa đúng format.
-4. THỰC DỤNG: Nếu đã đủ thông tin, hãy trả lời ngay bằng 'answer'.
+   - Trả lời trực tiếp: {"thought": "suy luận", "answer": "nội dung trả lời"}
+   - Dùng tool (công cụ): {"thought": "suy luận", "action": "tên_tool", "params": {"tên_tham_số": "giá_trị"}}
+3. TỰ SỬA LỖI: Nếu nhận được thông báo lỗi JSON từ hệ thống, hãy sửa và trả về JSON đúng.
 
-CÔNG CỤ:
-- "calculate": {"expression": "..."}
-- "get_weather": {"location": "..."}
-- "notion_search": {"query": "..."}
-- "notebook_query": {"notebook_id": "...", "query": "..."}
+DANH SÁCH CÔNG CỤ (CHỈ DÙNG CÁC CÔNG CỤ NÀY):
+- Tính toán toán học: "calculate" với params {"expression": "ví dụ: 5*3"}
+- Xem thời tiết: "get_weather" với params {"location": "tên thành phố, ví dụ: Sài Gòn"}
+- Tìm ghi chú: "notion_search" với params {"query": "từ khóa tìm kiếm"}
+- Đọc tài liệu: "notebook_query" với params {"notebook_id": "id", "query": "câu hỏi"}
 """
 
 def extract_json_safe(text: str) -> str:
@@ -109,7 +109,7 @@ class AgentEngine:
         default_metrics = {"success": 0, "fail": 0, "total_runs": 0, "avg_latency": 0.0}
         try:
             if os.path.exists(self.metrics_file):
-                with open(self.metrics_file, "r") as f:
+                with open(self.metrics_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     return {**default_metrics, **data}
         except Exception as e:
@@ -119,13 +119,14 @@ class AgentEngine:
     def _save_metrics(self):
         """Lưu Metrics xuống file JSON"""
         try:
-            with open(self.metrics_file, "w") as f:
-                json.dump(self.metrics, f, indent=4)
+            with open(self.metrics_file, "w", encoding="utf-8") as f:
+                json.dump(self.metrics, f, ensure_ascii=False, indent=4)
             logger.info("📊 METRICS UPDATED: Đã lưu bộ chỉ số hiệu năng.")
         except Exception as e:
             logger.error(f"Lỗi khi lưu metrics: {e}")
 
-    async def _call_llm(self, prompt: str, temperature: float = 0.2, is_retry: bool = False) -> str:
+    # [SỬA 1]: Thêm tham số model vào chữ ký hàm
+    async def _call_llm(self, prompt: str, model: str, temperature: float = 0.2, is_retry: bool = False) -> str:
         """Hàm bọc gọi Ollama LLM với BẢNG PHONG THẦN: Dynamic VRAM & Dual-Layer Timeout"""
         
         # [RESOURCE LAYER] Lấy tham số động dựa trên VRAM thực tế
@@ -133,7 +134,7 @@ class AgentEngine:
         dynamic_opts["temperature"] = temperature
         
         data = {
-            "model": self.model_name,
+            "model": model, # [SỬA 2]: Dùng biến model truyền vào, KHÔNG DÙNG self.model_name nữa
             "system": SYSTEM_PROMPT,
             "prompt": prompt,
             "stream": False,
@@ -175,9 +176,16 @@ class AgentEngine:
             logger.error(f"Network Timeout ({self.circuit_breaker['network']})")
             return "NETWORK_TIMEOUT"
 
-    async def run(self, user_input: str, max_iterations=5):
-        """Vòng lặp Agent chuẩn sản xuất với BẢNG PHONG THẦN"""
+    async def run(self, user_input: str, max_iterations=5, temperature=0.2, callback=None):
+        """Vòng lặp Agent chuẩn sản xuất với cơ chế Signal (Epic 2)"""
         import time
+
+        def emit(event_type, data):
+            if callback:
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.create_task(callback(event_type, data))
+                else:
+                    callback(event_type, data)
         start_time = time.time()
         
         self.current_action = None
@@ -187,19 +195,26 @@ class AgentEngine:
         self.circuit_breaker = {"network": 0, "json": 0, "tool": 0}
         logger.info(f"--- NEW RUN: {user_input} ---")
         
-        current_temp = 0.2
+        current_temp = temperature
         self.messages = [{"role": "user", "content": user_input}]
         
         iteration = 1
         retry_count = 0
         network_retries = 0
 
-        # [ROUTER LAYER] Kích hoạt não bộ phân luồng
-        selected_model = self.router.route_task(user_input)
-        if selected_model == "REJECT_TASK":
-            self.metrics["fail"] += 1
-            return "Task bị từ chối do hệ thống đang cạn kiệt VRAM. Vui lòng thử lại sau."
-        self.model_name = selected_model
+        # [ROUTER LAYER] Áp dụng Manual Override (Epic 4)
+        if self.model_name == "Auto (Smart Router)":
+            # Nếu User chọn Auto -> Cho phép Router tự động phân tích và chọn model
+            target_model = self.router.route_task(user_input)
+            if target_model == "REJECT_TASK":
+                self.metrics["fail"] += 1
+                return "Task bị từ chối do hệ thống đang cạn kiệt VRAM. Vui lòng thử lại sau."
+            emit("THINK", f"Router tự động điều hướng sang: {target_model}")
+        else:
+            # Nếu User đã chọn cứng model ở UI -> Khóa mõm Router, ép dùng model đó
+            target_model = self.model_name 
+            print(f"[MANUAL OVERRIDE] Tắt Router, ép dùng model: {target_model}")
+        
         
         while iteration <= max_iterations:
             # [FIX IMMUTABLE STATE]: Xóa các tin nhắn nhắc lỗi của vòng trước để Context luôn sạch
@@ -218,7 +233,7 @@ class AgentEngine:
                     "content": "ĐÂY LÀ LƯỢT CUỐI CÙNG. BẠN BẮT BUỘC PHẢI TRẢ LỜI NGƯỜI DÙNG. Hãy xuất JSON với duy nhất key 'answer' chứa nội dung trả lời."
                 })
 
-            print(f"🔄 Vòng lặp {iteration}/{max_iterations} (Temp: {current_temp:.1f})...")
+            print(f"[RETRY] Vòng lặp {iteration}/{max_iterations} (Temp: {current_temp:.1f})...")
             
             # [INTELLIGENCE LAYER] Immutable State
             # Mặc định dùng history sạch từ self.messages
@@ -226,12 +241,19 @@ class AgentEngine:
             
             async def task_wrapper(u_input, task_id, trace_id):
                 # is_retry = True nếu đang ở vòng lặp sau hoặc vừa gặp lỗi định dạng
-                res = await self._call_llm(u_input["prompt"], temperature=u_input["temperature"], is_retry=(iteration > 1 or retry_count > 0))
+                # [SỬA Ở ĐÂY]: Truyền thêm u_input["model"] vào _call_llm
+                res = await self._call_llm(
+                    prompt=u_input["prompt"], 
+                    model=u_input["model"], # <--- Dòng ăn tiền là đây!
+                    temperature=u_input["temperature"], 
+                    is_retry=(iteration > 1 or retry_count > 0)   
+                )
                 return {"status": "success", "data": res}
 
             try:
+                # [SỬA Ở ĐÂY]: Đóng gói thêm target_model vào từ điển gửi đi
                 gateway_res = await gateway_entry(
-                    {"prompt": current_prompt, "temperature": current_temp}, 
+                    {"prompt": current_prompt, "temperature": current_temp, "model": target_model},
                     task_wrapper
                 )
                 raw_response = gateway_res.get("data", "")
@@ -252,6 +274,7 @@ class AgentEngine:
                 
                 if "thought" in ai_json:
                     logger.info(f"🤔 Thought: {ai_json['thought']}")
+                    if callback: callback("THINK", ai_json["thought"])
                 
                 # CHẶN ĐƯỜNG TRẢ LỜI (FINAL ANSWER)
                 if "answer" in ai_json:
@@ -288,6 +311,7 @@ class AgentEngine:
                     self.last_action_signature = action_signature
                     self.current_action = tool_name
                     logger.info(f"🛠️ CALLING TOOL: {tool_name}")
+                    if callback: callback("ACT", f"Gọi công cụ: {tool_name}")
                     
                     tool_func = AVAILABLE_TOOLS[tool_name]
                     try:
@@ -295,6 +319,7 @@ class AgentEngine:
                             self.observation = await tool_func(**params)
                         else:
                             self.observation = tool_func(**params)
+                        if callback: callback("OBSERVE", f"Kết quả: {self.observation}")
                     except Exception as e:
                         # 🔴 FIX BUG: Ghi nhớ tool lỗi để lần sau AI chừa mặt nó ra
                         self.failed_actions.append(action_signature)
@@ -331,6 +356,7 @@ class AgentEngine:
                 current_temp = max(0.0, current_temp - 0.1)
                 
                 logger.warning(f"⚠️ Trigger Self-Repair: {e}")
+                emit("REPAIR", str(e))
                 
                 # Bơm thẳng lời nhắc lỗi vào self.messages NHƯNG ĐÁNH DẤU NÓ LÀ TEMP
                 repair_prompt = f"LỖI ĐỊNH DẠNG: {e}. HÃY TRẢ VỀ JSON CHUẨN CÓ KEY 'answer' HOẶC 'action'."
@@ -346,7 +372,7 @@ class AgentEngine:
                 
                 continue
             
-        print("❌ Quá số lượt lặp (Max Iterations), bắt buộc dừng Agent lại để chống lặp vĩnh viễn!")
+        print("[ERROR] Quá số lượt lặp (Max Iterations), bắt buộc dừng Agent lại để chống lặp vĩnh viễn!")
         logger.error("❌ Quá số lượt lặp (Max Iterations). Agent không thể đưa ra đáp án cuối cùng.")
         self.metrics["fail"] += 1
         return "Tôi không thể hoàn thành yêu cầu với các thông tin và công cụ hiện tại. Vui lòng cung cấp thêm chi tiết hoặc thử lại."
