@@ -118,6 +118,16 @@ class LocalRAG:
         
         distances, indices = self.index.search(query_vector, top_k)
 
+        # --- [FIX]: Ép Threshold cực thấp (0.05) để vớt tài liệu tiếng Việt ---
+        if len(distances[0]) > 0:
+            TOP_SCORE = distances[0][0]
+            if TOP_SCORE < 0.05: 
+                return "Không tìm thấy thông tin liên quan trong tài liệu nội bộ."
+            THRESHOLD = 0.05 
+        else:
+            return "Không tìm thấy thông tin liên quan trong tài liệu nội bộ."
+        # ----------------------------------------------------------------------
+
         scored_results = []
 
         for i in range(len(indices[0])):
@@ -127,7 +137,7 @@ class LocalRAG:
             if idx != -1 and idx < len(self.chunks) and score >= THRESHOLD:
                 scored_results.append((score, self.chunks[idx]))
 
-        scored_results.sort(key=lambda x: x[0], reverse=True)
+        scored_results.sort(key=lambda x: x[0], reverse=True)   
         results = [item[1] for item in scored_results]
 
         if not results:

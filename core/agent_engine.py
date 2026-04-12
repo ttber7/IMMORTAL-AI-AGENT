@@ -40,7 +40,7 @@ def tool_calculate(expression: str) -> str:
 def tool_web_search(query: str) -> str:
     """Tìm kiếm trên Internet sử dụng DuckDuckGo"""
     try:
-        results = DDGS().text(query, max_results=3)
+        results = DDGS().text(query, region='vn-vi', max_results=3)
         formatted_results = []
         for r in results:
             formatted_results.append({
@@ -62,6 +62,7 @@ LỆNH CƯỠNG CHẾ (BẤT BIẾN):
 3. JSON của bạn PHẢI tuân thủ 1 trong 2 cấu trúc:
    - Trả lời trực tiếp: {"thought": "suy luận", "answer": "nội dung trả lời"}
    - Dùng tool (công cụ): {"thought": "suy luận", "action": "tên_tool", "params": {"tên_tham_số": "giá_trị"}}
+4. TRẢ LỜI ĐẦY ĐỦ: Nếu người dùng hỏi nhiều ý trong một câu (có chữ VÀ), bạn BẮT BUỘC phải đọc kỹ toàn bộ dữ liệu và trả lời ĐẦY ĐỦ tất cả các vế của câu hỏi, không được bỏ sót.
 
 QUY TẮC ƯU TIÊN TÌM KIẾM (QUAN TRỌNG):
 - Nếu câu hỏi về công ty, dự án nội bộ, lịch sử: DÙNG "search_document".
@@ -72,6 +73,7 @@ DANH SÁCH CÔNG CỤ (CHỈ DÙNG CÁC CÔNG CỤ NÀY):
 - Tính toán toán học: "calculate" với params {"expression": "ví dụ: 5*3"}
 - Tìm kiếm Internet: "web_search" với params {"query": "từ khóa tìm kiếm"}. LƯU Ý: Luôn tự đọc hiểu và tóm tắt kết quả thành câu trả lời tự nhiên.
 - Đọc tài liệu nội bộ: "search_document" với params {"query": "từ khóa tìm kiếm"}
+. TRẢ LỜI ĐẦY ĐỦ: Nếu người dùng hỏi nhiều ý trong một câu (có chữ VÀ), bạn BẮT BUỘC phải đọc kỹ toàn bộ dữ liệu và trả lời ĐẦY ĐỦ tất cả các vế của câu hỏi, không được bỏ sót.
 """
 
 def extract_json_safe(text: str) -> str:
