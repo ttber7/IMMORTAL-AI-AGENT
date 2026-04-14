@@ -1,3 +1,9 @@
+import os
+import warnings
+os.environ["TRANSFORMERS_VERBOSITY"] = "error" # Tắt log nội bộ của HuggingFace
+warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import streamlit as st
 import asyncio
 import json
@@ -18,6 +24,10 @@ if "messages" not in st.session_state:
 
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
+
+# 🟢 FIX CHUẨN: Khởi tạo biến này ngay từ đầu để đảm bảo an toàn tuyệt đối
+if "last_ui_update" not in st.session_state:
+    st.session_state.last_ui_update = 0.0
 
 # [EPIC 4] Settings State
 
@@ -46,44 +56,40 @@ def get_vector_store_cache(_embedder):
     return LocalRAG.initialize_vector_store(_embedder)
 
 @st.cache_resource
-def get_engine_cache():
-    """Khởi tạo một Dictionary duy nhất để quản lý Engine (Cache lớp 3)"""
-    return {} # Trả về một từ điển trống
+def get_local_rag_cache(_embedder, _vector_store, chunks):
+    """Khởi tạo và Cache đối tượng LocalRAG (Cache lớp 3)"""
+    return LocalRAG(embedder=_embedder, vector_store=_vector_store, chunks=chunks)
 
-# Khởi tạo LocalRAG Instance an toàn với Cache
+# Khởi tạo an toàn
 embedder = get_embedder_cache()
 vector_store, chunks = get_vector_store_cache(embedder)
-local_rag = LocalRAG(embedder=embedder, vector_store=vector_store, chunks=chunks)
-
-# Lấy từ điển quản lý Engine
-engine_manager = get_engine_cache()
+local_rag = get_local_rag_cache(embedder, vector_store, chunks)
 
 # Lấy tên Model hiện tại từ UI
-current_model = st.session_state.base_model
+#  current_model = st.session_state.base_model
 
-# Logic "One-In, One-Out" (Chỉ giữ 1 model trong RAM)
-if current_model not in engine_manager:
-    # Nếu đổi Model -> XÓA SẠCH model cũ khỏi từ điển để giải phóng VRAM
-    engine_manager.clear() 
-    
-    print(f"\n[SYSTEM] [INITIALIZING] AgentEngine with {current_model}...\n")
-    engine_manager[current_model] = AgentEngine(model_name=current_model, local_rag=local_rag)
+@st.cache_data(ttl=1)
+def get_cached_gpu_stats():
+    """Lấy số liệu GPU với độ trễ tối đa 1 giây để chống nghẽn Driver"""
+    return monitor.get_gpu_stats()
 
-# Lấy Engine ra để sử dụng
-engine = engine_manager[current_model]
+# 🟢 VÁ LỖI 3: Cache kết quả NVML trong 1 giây để chống Spam Driver
+# 🟢 VÁ LỖI I/O: Cache Metrics 2 giây để tránh đọc ổ cứng liên tục
+@st.cache_data(ttl=2)
+def get_cached_metrics():
+    try:
+        with open("agent_metrics.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"success": 0, "fail": 0, "total_runs": 0, "avg_latency": 0.0}
 
-# ==========================================
-# [TELEMETRY LAYER]: 3 Golden Moments Strategy
-# ==========================================
-# ==========================================
-# [TELEMETRY LAYER]: 3 Golden Moments Strategy
-# ==========================================
 # ==========================================
 # [TELEMETRY LAYER]: 3 Golden Moments Strategy
 # ==========================================
 def render_telemetry(container):
     """Render giao diện giám sát Phần cứng & Hiệu năng vào một placeholder"""
-    raw_stats = monitor.get_gpu_stats()
+    # Thay vì gọi trực tiếp monitor.get_gpu_stats(), ta gọi qua Cache
+    raw_stats = get_cached_gpu_stats()
     
     # [KHIÊN BẢO VỆ]: Nếu NVML lỗi, dùng data giả để giữ khung UI không bị sập
     stats = raw_stats or {
@@ -91,12 +97,8 @@ def render_telemetry(container):
         "temp": 0, "gpu_util": 0, "status": "offline"
     }
 
-    # Đọc Metrics từ bộ não Agent
-    try:
-        with open("agent_metrics.json", "r", encoding="utf-8") as f:
-            agent_metrics = json.load(f)
-    except Exception:
-        agent_metrics = {"success": 0, "fail": 0, "total_runs": 0, "avg_latency": 0.0}
+    # 🟢 SỬ DỤNG CACHE THAY VÌ ĐỌC FILE
+    agent_metrics = get_cached_metrics()
 
     # [FIX LỖI GHI ĐÈ UI TẠI ĐÂY]: Thêm .container()
     with container.container(): 
@@ -150,20 +152,32 @@ def render_telemetry(container):
 # ==========================================
 class AsyncBridge:
     @staticmethod
-    def run_agent(engine_instance, user_input, max_iter, temp, event_callback=None):
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(engine_instance.run(
+    def run_agent(model_name, local_rag_instance, user_input, max_iter, temp, event_callback=None):
+        def sync_callback(event_type, data):
+            if event_callback:
+                event_callback(event_type, data)
+
+        async def _run():
+            # 🟢 Khởi tạo bình thường, không cần async with nữa
+            engine = AgentEngine(model_name=model_name, local_rag=local_rag_instance)
+            return await engine.run(
                 user_input, 
                 max_iterations=max_iter, 
                 temperature=temp,
-                callback=event_callback
-            ))
-        finally:
-            asyncio.set_event_loop(None) 
-            loop.close()
+                callback=sync_callback
+            )
 
+        # Bảo vệ chống lỗi Event Loop
+        try:
+            return asyncio.run(_run())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(_run())
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
 
 # ==========================================
 # SIDEBAR & MOMENT 1 (Initialization)
@@ -191,11 +205,11 @@ with st.sidebar:
         index=available_models.index(st.session_state.base_model)
     )
 
-    # NẾU PHÁT HIỆN ĐỔI MODEL -> GIẬT SẬP CACHE ĐỂ GIẢI PHÓNG VRAM
+    # 🟢 VÁ LỖI 2: KHÔNG XÓA CACHE (Không dùng clear() nữa). 
+    # Ollama sẽ tự quản lý VRAM khi có request model mới.
     if selected_model != st.session_state.base_model:
         st.session_state.base_model = selected_model
-        st.cache_resource.clear() # Xóa sạch Cache VRAM
-        st.rerun() # F5 tải lại trang để nạp model mới
+        st.rerun() # Chỉ F5 lại UI nhẹ nhàng
 
     st.markdown("---") # Đường kẻ phân cách
     
@@ -243,7 +257,6 @@ for message in st.session_state.messages:
 user_input = st.chat_input("Hỏi tôi bất cứ điều gì...", disabled=st.session_state.is_running)
 
 if user_input:
-    # MOMENT 2 (Pre-run)
     render_telemetry(telemetry_container)
     
     st.session_state.messages.append({"role": "user", "content": user_input})
@@ -251,46 +264,69 @@ if user_input:
         st.markdown(user_input)
 
     st.session_state.is_running = True
+
+    # 🟢 RESET LẠI THỜI GIAN TRƯỚC MỖI LẦN CHẠY
+    st.session_state.last_ui_update = 0.0
     
     with st.chat_message("assistant"):
         status_placeholder = st.status("🔮 Agent đang phân tích...", expanded=True)
-        
+            
+        import time
+
         def on_agent_event(event_type, data):
+            # Nếu sự kiện quá sát nhau (< 0.2s), chỉ cập nhật lén ở status_placeholder.update, không dùng st.markdown
+            current_time = time.time()
+            is_fast = (current_time - st.session_state.last_ui_update) < 0.2
+            
             display_data = str(data)
             if len(display_data) > 300:
                 display_data = display_data[:300] + "..."
 
             with status_placeholder:
                 if event_type == "THINK":
-                    st.markdown(f"**🤔 THINK:** _{display_data}_")
+                    if not is_fast: st.markdown(f"**🤔 THINK:** _{display_data}_")
                     status_placeholder.update(label="🤔 Đang suy nghĩ...")
                 elif event_type == "ACT":
-                    st.markdown(f"🛠️ **ACT:** `{display_data}`")
+                    if not is_fast: st.markdown(f"🛠️ **ACT:** `{display_data}`")
                     status_placeholder.update(label="🛠️ Đang sử dụng công cụ...")
                 elif event_type == "OBSERVE":
-                    st.info(f"👁️ **OBSERVE:** {display_data}")
+                    if not is_fast: st.info(f"👁️ **OBSERVE:** {display_data}")
                     status_placeholder.update(label="👁️ Phân tích kết quả...")
                 elif event_type == "REPAIR":
-                    st.warning(f"⚠️ **SELF-REPAIR:** {display_data}")
+                    st.warning(f"⚠️ **SELF-REPAIR:** {display_data}") # Lỗi thì luôn hiển thị
                     status_placeholder.update(label="⚠️ Tự động sửa lỗi...")
+                elif event_type == "QUEUE_WAITING":
+                    # Không spam toast, chỉ update label
+                    status_placeholder.update(label=f"⏳ Đang chờ GPU (Vị trí: {display_data})...")
+            
+            st.session_state.last_ui_update = current_time
 
-        # Chạy Agent với thông số động
         final_temp = 0.0 if st.session_state.turbo_mode else st.session_state.temp_val
         final_iter = 3 if st.session_state.turbo_mode else st.session_state.iter_val
         
-        response = AsyncBridge.run_agent(
-            engine, 
-            user_input, 
-            max_iter=final_iter,
-            temp=final_temp,
-            event_callback=on_agent_event
-        )
-        
-        status_placeholder.update(label="✅ Xử lý hoàn tất!", state="complete", expanded=False)
-        st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        # 🟢 BẮT LỖI TẠI TẦNG UI (Ngăn sập app)
+        try:
+            response = AsyncBridge.run_agent(
+                model_name=st.session_state.base_model,
+                local_rag_instance=local_rag,
+                user_input=user_input, 
+                max_iter=final_iter,
+                temp=final_temp,
+                event_callback=on_agent_event
+            )
+            # 🟢 VÁ LỖI UX: Dọn sạch hoàn toàn hộp Status thay vì để lại cục rác
+            status_placeholder.empty() 
+            
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            
+        except Exception as e:
+            error_msg = f"Hệ thống gặp sự cố nội bộ: {str(e)}"
+            # 🟢 VỚI LỖI THÌ GIỮ LẠI STATUS ĐỂ USER BIẾT
+            status_placeholder.update(label="❌ Xử lý thất bại!", state="error", expanded=False)
+            st.error(error_msg)
+            st.session_state.messages.append({"role": "assistant", "content": f"⚠️ {error_msg}"})
 
-    # MOMENT 3 (Post-run): Cập nhật VRAM sau khi xả cache
     st.session_state.is_running = False
     st.rerun()
 

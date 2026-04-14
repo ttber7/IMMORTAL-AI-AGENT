@@ -1,5 +1,7 @@
+import inspect
 import json
 import re
+import aiohttp
 from duckduckgo_search import DDGS
 from core.local_rag import LocalRAG
 import uuid
@@ -28,14 +30,22 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 
 # Danh sách đăng ký Tool (Tool Registry)
 def tool_calculate(expression: str) -> str:
-    """Công cụ thực thi phép toán cơ bản"""
+    """Công cụ thực thi phép toán cơ bản (Có bảo mật)"""
+    # 🟢 VÁ LỖI 3: Chặn biểu thức quá dài (DoS) và chặn phép tính Mũ (**)
+    if len(expression) > 50:
+        return "Lỗi: Biểu thức toán học quá dài."
+    if "**" in expression:
+        return "Lỗi: Hệ thống không hỗ trợ phép tính lũy thừa."
+        
     if not re.match(r'^[\d\+\-\*\/\.\(\)\s]+$', expression):
-        return "Lỗi bảo mật: Biểu thức toán học chứa ký tự không hợp lệ."
+        return "Lỗi bảo mật: Biểu thức chứa ký tự không hợp lệ."
     try:
         result = eval(expression, {"__builtins__": None}, {})
         return f"Kết quả: {result}"
+    except ZeroDivisionError:
+        return "Lỗi toán học: Không thể chia cho 0."
     except Exception as e:
-        return f"Lỗi toán học: {e}"
+        return f"Lỗi toán học: Cú pháp không hợp lệ."
 
 def tool_web_search(query: str) -> str:
     """Tìm kiếm trên Internet sử dụng DuckDuckGo"""
@@ -106,9 +116,10 @@ class AgentEngine:
         # Internal State
         self.current_action = None
         self.observation = None
-        self.failed_actions = [] 
         self.last_action_signature = None
         self.circuit_breaker = {"network": 0, "json": 0, "tool": 0}
+        self.harvested_data = [] 
+        self._http_session = None # Global Session cho Aiohttp
 
     def _load_metrics(self) -> Dict[str, Any]:
         """Tải Metrics từ file JSON"""
@@ -131,16 +142,15 @@ class AgentEngine:
         except Exception as e:
             logger.error(f"Lỗi khi lưu metrics: {e}")
 
-    # [SỬA 1]: Thêm tham số model vào chữ ký hàm
+    # 🟢 VÁ LỖI 1: Dọn rác Dead Code, gộp Timeout chuẩn Production
     async def _call_llm(self, prompt: str, model: str, temperature: float = 0.2, is_retry: bool = False) -> str:
-        """Hàm bọc gọi Ollama LLM với BẢNG PHONG THẦN: Dynamic VRAM & Dual-Layer Timeout"""
+        """Hàm gọi Ollama chuẩn Non-blocking (Tự quản lý Session riêng biệt)"""
         
-        # [RESOURCE LAYER] Lấy tham số động dựa trên VRAM thực tế
         dynamic_opts = self.router.get_dynamic_params(is_retry=is_retry)
         dynamic_opts["temperature"] = temperature
         
         data = {
-            "model": model, # [SỬA 2]: Dùng biến model truyền vào, KHÔNG DÙNG self.model_name nữa
+            "model": model, 
             "system": SYSTEM_PROMPT,
             "prompt": prompt,
             "stream": False,
@@ -157,18 +167,25 @@ class AgentEngine:
             "options": dynamic_opts
         }
         
-        def run_sync():
-            try:
-                req = urllib.request.Request(OLLAMA_URL, json.dumps(data).encode('utf-8'))
-                req.add_header('Content-Type', 'application/json')
-                
-                # Lớp 1: Socket Timeout (55s)
-                with urllib.request.urlopen(req, timeout=55.0) as response:
-                    result = json.loads(response.read().decode())
-                    return result.get("response", "")
-            except Exception as e:
-                logger.error(f"Socket/Urllib Error: {e}")
-                return "SOCKET_TIMEOUT_OR_ERROR"
+        try:
+            # Dùng asyncio.timeout làm lớp bảo vệ tối thượng
+            async with asyncio.timeout(60.0):
+                # 🟢 VÁ LỖI TRÙM CUỐI: Khởi tạo và đóng Session ngay tại đây. Không tranh giành giữa các luồng!
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(OLLAMA_URL, json=data) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            return result.get("response", "")
+                        else:
+                            logger.error(f"Lỗi HTTP từ Ollama: {response.status}")
+                            return "SOCKET_TIMEOUT_OR_ERROR"
+        except asyncio.TimeoutError:
+            self.circuit_breaker["network"] += 1
+            logger.error(f"Network Timeout ({self.circuit_breaker['network']})")
+            return "NETWORK_TIMEOUT"
+        except Exception as e:
+            logger.error(f"Aiohttp Error: {e}")
+            return "SOCKET_TIMEOUT_OR_ERROR"
         
         # Lớp 2: Asyncio Timeout (60s)
         try:
@@ -188,7 +205,7 @@ class AgentEngine:
 
         def emit(event_type, data):
             if callback:
-                if asyncio.iscoroutinefunction(callback):
+                if inspect.iscoroutinefunction(callback):
                     asyncio.create_task(callback(event_type, data))
                 else:
                     callback(event_type, data)
@@ -199,6 +216,7 @@ class AgentEngine:
         self.failed_actions = []
         self.last_action_signature = None
         self.circuit_breaker = {"network": 0, "json": 0, "tool": 0}
+        self.harvested_data = [] # Reset buffer thu hoạch
         logger.info(f"--- NEW RUN: {user_input} ---")
         
         current_temp = temperature
@@ -238,6 +256,7 @@ class AgentEngine:
                     "role": "user", 
                     "content": "ĐÂY LÀ LƯỢT CUỐI CÙNG. BẠN BẮT BUỘC PHẢI TRẢ LỜI NGƯỜI DÙNG. Hãy xuất JSON với duy nhất key 'answer' chứa nội dung trả lời."
                 })
+                current_temp = 0.0 # 🟢 VÁ LỖI 4: Ép nhiệt độ về 0 để tuyệt đối không sáng tạo bậy bạ
 
             print(f"[RETRY] Vòng lặp {iteration}/{max_iterations} (Temp: {current_temp:.1f})...")
             
@@ -254,13 +273,26 @@ class AgentEngine:
                     temperature=u_input["temperature"], 
                     is_retry=(iteration > 1 or retry_count > 0)   
                 )
-                return {"status": "success", "data": res}
+                return res # 🟢 FIX CRITICAL: Trả thẳng string, KHÔNG wrap Dict nữa
 
             try:
-                # [SỬA Ở ĐÂY]: Đóng gói thêm target_model vào từ điển gửi đi
+                # 🟢 FIX PRIORITY LOGIC CHUẨN
+                if iteration == 1:
+                    p_level = 0  # Câu hỏi đầu tiên của User: Ưu tiên chớp nhoáng
+                elif self.current_action == "calculate":
+                    p_level = 0  # Tính toán nhanh
+                elif self.current_action == "search_document":
+                    p_level = 1  # RAG đọc file nội bộ
+                elif self.current_action == "web_search":
+                    p_level = 3  # Web Search: Vứt xuống đáy chờ vì tốn I/O
+                else:
+                    p_level = 1  # Reasoning bình thường (sau tool): Ưu tiên cao để nhanh chóng kết thúc
+
                 gateway_res = await gateway_entry(
                     {"prompt": current_prompt, "temperature": current_temp, "model": target_model},
-                    task_wrapper
+                    task_wrapper,
+                    priority_level=p_level,
+                    status_callback=emit # Truyền callback để báo cáo vị trí hàng đợi
                 )
                 raw_response = gateway_res.get("data", "")
                 
@@ -330,10 +362,14 @@ class AgentEngine:
                     
                     tool_func = self.available_tools[tool_name]
                     try:
-                        if asyncio.iscoroutinefunction(tool_func):
+                        if inspect.iscoroutinefunction(tool_func):
                             self.observation = await tool_func(**params)
                         else:
                             self.observation = tool_func(**params)
+                        
+                        # [PHASE 5] HARVESTING: Lưu lại kết quả có ích
+                        self.harvested_data.append(f"Tool `{tool_name}` quan sát được: {self.observation}")
+                        
                         emit("OBSERVE", f"Kết quả: {self.observation}")
                     except Exception as e:
                         # 🔴 FIX BUG: Ghi nhớ tool lỗi để lần sau AI chừa mặt nó ra
@@ -400,10 +436,30 @@ class AgentEngine:
                 
                 continue
             
-        print("[ERROR] Quá số lượt lặp (Max Iterations), bắt buộc dừng Agent lại để chống lặp vĩnh viễn!")
-        logger.error("❌ Quá số lượt lặp (Max Iterations). Agent không thể đưa ra đáp án cuối cùng.")
-        self.metrics["fail"] += 1
-        return "Tôi không thể hoàn thành yêu cầu với các thông tin và công cụ hiện tại. Vui lòng cung cấp thêm chi tiết hoặc thử lại."
+        # [PHASE 5] GRACEFUL DEGRADATION (BƯỚC PHỤC HỒI CUỐI CÙNG)
+        logger.warning("❌ Quá số lượt lặp (Max Iterations). Kích hoạt chế độ Phục hồi Dữ liệu tĩnh...")
+        
+        self.metrics["fail"] += 1 
+        self._save_metrics()
+        
+        if not self.harvested_data:
+            return "Xin lỗi, tôi không thể hoàn thành yêu cầu này và cũng không tìm thấy thông tin nào liên quan."
+
+        # Ghép chuỗi tĩnh bằng Markdown thay vì gọi LLM (Bảo vệ VRAM)
+        formatted_data = "\n\n".join([f"- {item}" for item in self.harvested_data[:3]]) # Lấy tối đa 3 kết quả để không bị rác
+        
+        recovery_answer = (
+            "Tôi xin lỗi, do giới hạn hệ thống tôi chưa thể đưa ra kết luận cuối cùng cho câu hỏi của bạn. "
+            "Tuy nhiên, đây là những thông tin hữu ích tôi đã thu thập được trong quá trình tìm kiếm:\n\n"
+            f"{formatted_data}"
+        )
+        
+        return recovery_answer
+    async def close(self):
+        """🟢 Đóng kết nối HTTP để tránh Leak Socket (Quét dọn rác)"""
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            logger.info("🔌 Đã đóng an toàn kết nối HTTP của AgentEngine.")
 
 # === Test nhanh tích hợp liền tay ===
 if __name__ == "__main__":

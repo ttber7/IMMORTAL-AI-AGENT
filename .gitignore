@@ -6,3 +6,8 @@ venv/
 .venv/
 env/
 .pytest_cache/
+chrome_profile_notebooklm/
+agent_metrics.json
+scratch/
+test_phase5.py
+*.md.bak
