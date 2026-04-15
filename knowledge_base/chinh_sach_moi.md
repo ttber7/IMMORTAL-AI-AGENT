@@ -1,0 +1,1 @@
+Từ năm 2026, nhân viên được nghỉ thêm thứ 7

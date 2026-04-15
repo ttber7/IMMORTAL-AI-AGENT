@@ -3,15 +3,11 @@ import json
 import re
 import aiohttp
 from duckduckgo_search import DDGS
-from core.local_rag import LocalRAG
-import uuid
-import urllib.request
 import asyncio
 import logging
 import os
-from typing import List, Dict, Any
+from typing import Dict, Any
 
-from core.gateway import gateway_entry
 from core.adaptive_router import AdaptiveRouter
 
 logger = logging.getLogger(__name__)
@@ -78,12 +74,12 @@ QUY TẮC ƯU TIÊN TÌM KIẾM (QUAN TRỌNG):
 - Nếu câu hỏi về công ty, dự án nội bộ, lịch sử: DÙNG "search_document".
 - Nếu câu hỏi về tin tức thời sự, giá cả, sự kiện hiện tại: DÙNG "web_search".
 - Nếu "search_document" trả về 'Không tìm thấy thông tin', BẮT BUỘC dùng "web_search" để tìm mạng ngoài.
+- NẾU YÊU CẦU SÁNG TẠO (kể chuyện, làm thơ, viết code, trò chuyện bình thường): KHÔNG DÙNG CÔNG CỤ NÀO CẢ, hãy TRẢ LỜI TRỰC TIẾP bằng key "answer".
 
 DANH SÁCH CÔNG CỤ (CHỈ DÙNG CÁC CÔNG CỤ NÀY):
 - Tính toán toán học: "calculate" với params {"expression": "ví dụ: 5*3"}
 - Tìm kiếm Internet: "web_search" với params {"query": "từ khóa tìm kiếm"}. LƯU Ý: Luôn tự đọc hiểu và tóm tắt kết quả thành câu trả lời tự nhiên.
 - Đọc tài liệu nội bộ: "search_document" với params {"query": "từ khóa tìm kiếm"}
-. TRẢ LỜI ĐẦY ĐỦ: Nếu người dùng hỏi nhiều ý trong một câu (có chữ VÀ), bạn BẮT BUỘC phải đọc kỹ toàn bộ dữ liệu và trả lời ĐẦY ĐỦ tất cả các vế của câu hỏi, không được bỏ sót.
 """
 
 def extract_json_safe(text: str) -> str:
@@ -169,7 +165,7 @@ class AgentEngine:
         
         try:
             # Dùng asyncio.timeout làm lớp bảo vệ tối thượng
-            async with asyncio.timeout(60.0):
+            async with asyncio.timeout(120.0):
                 # 🟢 VÁ LỖI TRÙM CUỐI: Khởi tạo và đóng Session ngay tại đây. Không tranh giành giữa các luồng!
                 async with aiohttp.ClientSession() as session:
                     async with session.post(OLLAMA_URL, json=data) as response:
@@ -186,18 +182,6 @@ class AgentEngine:
         except Exception as e:
             logger.error(f"Aiohttp Error: {e}")
             return "SOCKET_TIMEOUT_OR_ERROR"
-        
-        # Lớp 2: Asyncio Timeout (60s)
-        try:
-            async with asyncio.timeout(60.0):
-                result_text = await asyncio.to_thread(run_sync)
-                if result_text == "SOCKET_TIMEOUT_OR_ERROR":
-                    raise TimeoutError("Lỗi kết nối vật lý tới Ollama")
-                return result_text
-        except TimeoutError:
-            self.circuit_breaker["network"] += 1
-            logger.error(f"Network Timeout ({self.circuit_breaker['network']})")
-            return "NETWORK_TIMEOUT"
 
     async def run(self, user_input: str, max_iterations=5, temperature=0.2, callback=None):
         """Vòng lặp Agent chuẩn sản xuất với cơ chế Signal (Epic 2)"""
@@ -263,50 +247,28 @@ class AgentEngine:
             # [INTELLIGENCE LAYER] Immutable State
             # Mặc định dùng history sạch từ self.messages
             current_prompt = "\n".join([f"{m['role']}: {m['content']}" for m in self.messages])
+
+            # VÁ LỖI CỐT LÕI: GỌI TRỰC TIẾP VÀO _call_llm, GỠ BỎ HOÀN TOÀN gateway_entry
+            raw_response = await self._call_llm(
+                prompt=current_prompt,
+                model=target_model,
+                temperature=current_temp,
+                is_retry=(iteration > 1 or retry_count > 0)
+            )
             
-            async def task_wrapper(u_input, task_id, trace_id):
-                # is_retry = True nếu đang ở vòng lặp sau hoặc vừa gặp lỗi định dạng
-                # [SỬA Ở ĐÂY]: Truyền thêm u_input["model"] vào _call_llm
-                res = await self._call_llm(
-                    prompt=u_input["prompt"], 
-                    model=u_input["model"], # <--- Dòng ăn tiền là đây!
-                    temperature=u_input["temperature"], 
-                    is_retry=(iteration > 1 or retry_count > 0)   
-                )
-                return res # 🟢 FIX CRITICAL: Trả thẳng string, KHÔNG wrap Dict nữa
+            if not raw_response or raw_response in ["NETWORK_TIMEOUT", "SOCKET_TIMEOUT_OR_ERROR"]:
+                network_retries += 1
+                if network_retries > 3:
+                    self.metrics["fail"] += 1
+                    return "Lỗi kết nối mạng nghiêm trọng. Vui lòng kiểm tra lại hệ thống."
+                
+                logger.warning(f"Lỗi mạng/Timeout lần {network_retries}. Đang thử lại...")
+                await asyncio.sleep(2 ** network_retries) 
+                continue
+
+            logger.info(f"RAW RESPONSE (Iter {iteration}):\n{raw_response}")
 
             try:
-                # 🟢 FIX PRIORITY LOGIC CHUẨN
-                if iteration == 1:
-                    p_level = 0  # Câu hỏi đầu tiên của User: Ưu tiên chớp nhoáng
-                elif self.current_action == "calculate":
-                    p_level = 0  # Tính toán nhanh
-                elif self.current_action == "search_document":
-                    p_level = 1  # RAG đọc file nội bộ
-                elif self.current_action == "web_search":
-                    p_level = 3  # Web Search: Vứt xuống đáy chờ vì tốn I/O
-                else:
-                    p_level = 1  # Reasoning bình thường (sau tool): Ưu tiên cao để nhanh chóng kết thúc
-
-                gateway_res = await gateway_entry(
-                    {"prompt": current_prompt, "temperature": current_temp, "model": target_model},
-                    task_wrapper,
-                    priority_level=p_level,
-                    status_callback=emit # Truyền callback để báo cáo vị trí hàng đợi
-                )
-                raw_response = gateway_res.get("data", "")
-                
-                if not raw_response or raw_response == "NETWORK_TIMEOUT":
-                    network_retries += 1
-                    if network_retries > 3:
-                        self.metrics["fail"] += 1
-                        return "Lỗi kết nối mạng nghiêm trọng. Vui lòng kiểm tra lại hệ thống."
-                    
-                    logger.warning(f"Lỗi mạng/Timeout lần {network_retries}. Đang thử lại...")
-                    await asyncio.sleep(2 ** network_retries) # Exponential Backoff (2s, 4s, 8s)
-                    continue # Bỏ qua logic parse JSON bên dưới, quay lại đầu vòng while gọi lại LLM
-                logger.info(f"RAW RESPONSE (Iter {iteration}):\n{raw_response}")
-
                 json_str = extract_json_safe(raw_response)
                 ai_json = json.loads(json_str)
                 
@@ -341,6 +303,7 @@ class AgentEngine:
                         self.metrics["avg_latency"] = (self.metrics["avg_latency"] * (self.metrics["total_runs"]-1) + latency) / self.metrics["total_runs"]
                         self._save_metrics()
                         return final_text
+
                     if action_signature == self.last_action_signature:
                         raise ValueError(f"PHÁT HIỆN VÒNG LẶP HÀNH ĐỘNG: Đừng gọi lại {tool_name} với cùng tham số này!")
                     
@@ -401,7 +364,6 @@ class AgentEngine:
                         self.messages = [self.messages[0]] + self.messages[-keep_amount:]
                     
                     current_temp = 0.2 # Reset nhiệt độ sau khi có thông tin mới
-                    
                     # [FLOW LAYER] Tiến tới bước tiếp theo và reset retry_count
                     iteration += 1
                     retry_count = 0
@@ -455,6 +417,7 @@ class AgentEngine:
         )
         
         return recovery_answer
+
     async def close(self):
         """🟢 Đóng kết nối HTTP để tránh Leak Socket (Quét dọn rác)"""
         if self._http_session and not self._http_session.closed:

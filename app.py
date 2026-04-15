@@ -1,15 +1,15 @@
 import os
 import warnings
-os.environ["TRANSFORMERS_VERBOSITY"] = "error" # Tắt log nội bộ của HuggingFace
+os.environ["TRANSFORMERS_VERBOSITY"] = "error" 
 warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import streamlit as st
-import asyncio
 import json
-from core.agent_engine import AgentEngine
+import httpx
+import time
+
 from core.resource_monitor import monitor
-from core.local_rag import LocalRAG
 
 st.set_page_config(
     page_title="THE IMMORTAL AI - Command Center",
@@ -25,56 +25,21 @@ if "messages" not in st.session_state:
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
 
-# 🟢 FIX CHUẨN: Khởi tạo biến này ngay từ đầu để đảm bảo an toàn tuyệt đối
 if "last_ui_update" not in st.session_state:
     st.session_state.last_ui_update = 0.0
 
-# [EPIC 4] Settings State
-
-if "temp_val" not in st.session_state:
-    st.session_state.temp_val = 0.2
-if "iter_val" not in st.session_state:
-    st.session_state.iter_val = 5
-if "turbo_mode" not in st.session_state:
-    st.session_state.turbo_mode = False
+# Settings State
+if "temp_val" not in st.session_state: st.session_state.temp_val = 0.2
+if "iter_val" not in st.session_state: st.session_state.iter_val = 5
+if "turbo_mode" not in st.session_state: st.session_state.turbo_mode = False
 if "base_model" not in st.session_state: st.session_state.base_model = "llama3.2:3b"
 
-# ==========================================
-# [RESOURCE LAYER]: Tối ưu VRAM cấp độ Enterprise (Chống rò rỉ bộ nhớ)
-# ==========================================
-@st.cache_resource
-def get_embedder_cache():
-    """Khởi tạo mô hình nhúng văn bản (Cache lớp 1)"""
-    embedder = LocalRAG.initialize_embedder()
-    # [PRE-WARM HACK]: Khởi động model ngay lập tức để nạp vào RAM
-    embedder.encode(["hello"])
-    return embedder
-
-@st.cache_resource
-def get_vector_store_cache(_embedder):
-    """Khởi tạo FAISS Vector Store (Cache lớp 2)"""
-    return LocalRAG.initialize_vector_store(_embedder)
-
-@st.cache_resource
-def get_local_rag_cache(_embedder, _vector_store, chunks):
-    """Khởi tạo và Cache đối tượng LocalRAG (Cache lớp 3)"""
-    return LocalRAG(embedder=_embedder, vector_store=_vector_store, chunks=chunks)
-
-# Khởi tạo an toàn
-embedder = get_embedder_cache()
-vector_store, chunks = get_vector_store_cache(embedder)
-local_rag = get_local_rag_cache(embedder, vector_store, chunks)
-
-# Lấy tên Model hiện tại từ UI
-#  current_model = st.session_state.base_model
+BACKEND_URL = "http://localhost:8000"
 
 @st.cache_data(ttl=1)
 def get_cached_gpu_stats():
-    """Lấy số liệu GPU với độ trễ tối đa 1 giây để chống nghẽn Driver"""
     return monitor.get_gpu_stats()
 
-# 🟢 VÁ LỖI 3: Cache kết quả NVML trong 1 giây để chống Spam Driver
-# 🟢 VÁ LỖI I/O: Cache Metrics 2 giây để tránh đọc ổ cứng liên tục
 @st.cache_data(ttl=2)
 def get_cached_metrics():
     try:
@@ -83,60 +48,40 @@ def get_cached_metrics():
     except Exception:
         return {"success": 0, "fail": 0, "total_runs": 0, "avg_latency": 0.0}
 
-# ==========================================
-# [TELEMETRY LAYER]: 3 Golden Moments Strategy
-# ==========================================
 def render_telemetry(container):
-    """Render giao diện giám sát Phần cứng & Hiệu năng vào một placeholder"""
-    # Thay vì gọi trực tiếp monitor.get_gpu_stats(), ta gọi qua Cache
     raw_stats = get_cached_gpu_stats()
-    
-    # [KHIÊN BẢO VỆ]: Nếu NVML lỗi, dùng data giả để giữ khung UI không bị sập
     stats = raw_stats or {
         "vram_used": 0, "vram_total": 4096, "vram_percent": 0.0,
         "temp": 0, "gpu_util": 0, "status": "offline"
     }
 
-    # 🟢 SỬ DỤNG CACHE THAY VÌ ĐỌC FILE
     agent_metrics = get_cached_metrics()
 
-    # [FIX LỖI GHI ĐÈ UI TẠI ĐÂY]: Thêm .container()
     with container.container(): 
-        # ===============================================
-        # 1. RADAR PHẦN CỨNG (SẼ KHÔNG BỊ MẤT NỮA)
-        # ===============================================
         st.subheader("🖥️ Hardware Radar")
-        
         if not raw_stats:
             st.error("❌ NVML Offline: Đang hiển thị Mock Data")
 
         col1, col2 = st.columns([2, 1])
         with col1:
-            # Vẽ thanh Progress VRAM (Cộng thêm min() để chống lỗi > 100%)
             vram_usage = min(stats["vram_percent"] / 100.0, 1.0)
             st.progress(vram_usage, text=f"VRAM: {stats['vram_percent']}%")
         with col2:
             st.write(f"{stats['vram_used']}/{stats['vram_total']} MB")
         
-        # Hiển thị Nhiệt độ & Core Load
         temp = stats["temp"]
         gpu_util = stats.get("gpu_util", 0) 
         temp_color = "red" if temp > 80 else ("orange" if temp > 70 else "green")
         st.markdown(f"🌡️ **Temperature:** :{temp_color}[{temp}°C] | ⚡ **Core Load:** {gpu_util}%")
         
-        # Cảnh báo an toàn
         if temp > 85:
             st.error("⚠️ CRITICAL: GPU quá nóng! Hãy tạm dừng để hạ nhiệt.")
         elif stats["vram_percent"] > 90:
             st.warning("⚠️ VRAM Check: Bộ nhớ sắp đầy!")
             
         st.caption(f"Status: {stats['status'].upper()} | Driver: NVIDIA NVML")
-        
-        st.divider() # Đường kẻ phân cách
+        st.divider() 
 
-        # ===============================================
-        # 2. THỐNG KÊ HIỆU NĂNG AI
-        # ===============================================
         st.subheader("📈 Agent Metrics")
         success = agent_metrics.get("success", 0)
         total = agent_metrics.get("total_runs", 0)
@@ -148,75 +93,32 @@ def render_telemetry(container):
         m_col3.metric("Độ trễ (s)", f"{agent_metrics.get('avg_latency', 0):.2f}")
 
 # ==========================================
-# [BRIDGE LAYER] Wrapper an toàn
-# ==========================================
-class AsyncBridge:
-    @staticmethod
-    def run_agent(model_name, local_rag_instance, user_input, max_iter, temp, event_callback=None):
-        def sync_callback(event_type, data):
-            if event_callback:
-                event_callback(event_type, data)
-
-        async def _run():
-            # 🟢 Khởi tạo bình thường, không cần async with nữa
-            engine = AgentEngine(model_name=model_name, local_rag=local_rag_instance)
-            return await engine.run(
-                user_input, 
-                max_iterations=max_iter, 
-                temperature=temp,
-                callback=sync_callback
-            )
-
-        # Bảo vệ chống lỗi Event Loop
-        try:
-            return asyncio.run(_run())
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(_run())
-            finally:
-                loop.close()
-                asyncio.set_event_loop(None)
-
-# ==========================================
-# SIDEBAR & MOMENT 1 (Initialization)
+# SIDEBAR
 # ==========================================
 with st.sidebar:
     st.title("📟 Control Center")
     st.markdown("---")
-    
-    # Placeholder cho Telemetry
     telemetry_container = st.empty()
     render_telemetry(telemetry_container)
-    
     st.markdown("---")
-    # [EPIC 4] Settings Section
+    
     st.subheader("⚙️ Engine Settings")
-
-    # Tính năng chọn Model an toàn
-   # Thêm "Auto (Smart Router)" lên đầu danh sách
     available_models = ["Auto (Smart Router)", "llama3.2:3b", "phi3:mini", "qwen2.5:3b"]
-    if "base_model" not in st.session_state: 
-        st.session_state.base_model = "Auto (Smart Router)" # Đặt mặc định là Auto
+    
     selected_model = st.selectbox(
         "🧠 Base Model", 
         available_models, 
         index=available_models.index(st.session_state.base_model)
     )
 
-    # 🟢 VÁ LỖI 2: KHÔNG XÓA CACHE (Không dùng clear() nữa). 
-    # Ollama sẽ tự quản lý VRAM khi có request model mới.
     if selected_model != st.session_state.base_model:
         st.session_state.base_model = selected_model
-        st.rerun() # Chỉ F5 lại UI nhẹ nhàng
+        st.rerun() 
 
-    st.markdown("---") # Đường kẻ phân cách
-    
+    st.markdown("---") 
     turbo = st.toggle("🚀 Turbo Mode", value=st.session_state.turbo_mode, help="Ép phản hồi nhanh nhất (Temp=0, Iter=3)")
     st.session_state.turbo_mode = turbo
     
-    # Nếu bật Turbo Mode thì khóa slider
     temp_input = st.slider("Creativity (Temp)", 0.0, 1.0, 
                           value=0.0 if turbo else st.session_state.temp_val, 
                           disabled=turbo)
@@ -235,9 +137,16 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    if st.button("🔄 Refresh Monitor", use_container_width=True):
-        render_telemetry(telemetry_container)
-        
+    if st.button("🔄 Reload RAG (Admin)", use_container_width=True):
+        try:
+            res = httpx.post(f"{BACKEND_URL}/admin/reload-rag", timeout=30.0)
+            if res.status_code == 200:
+                st.success("Tải lại tri thức thành công!")
+            else:
+                st.error("Lỗi khi tải lại tri thức.")
+        except Exception as e:
+            st.error(f"Không thể kết nối đến Backend: {e}")
+
     if st.button("🗑️ Clear History", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -246,91 +155,124 @@ with st.sidebar:
 # MAIN UI
 # ==========================================
 st.title("🤖 THE IMMORTAL AI AGENT")
-st.caption("Quadro T2000 Edition | Self-Healing Core v2.0")
+st.caption("Quadro T2000 Edition | Microservices v6.0")
 
-# Hiển thị lịch sử chat
 for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    if not message.get("is_temp", False):
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-# Input với Safety Lock
 user_input = st.chat_input("Hỏi tôi bất cứ điều gì...", disabled=st.session_state.is_running)
 
 if user_input:
     render_telemetry(telemetry_container)
     
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({"role": "user", "content": user_input, "is_temp": False})
     with st.chat_message("user"):
         st.markdown(user_input)
 
     st.session_state.is_running = True
-
-    # 🟢 RESET LẠI THỜI GIAN TRƯỚC MỖI LẦN CHẠY
     st.session_state.last_ui_update = 0.0
     
     with st.chat_message("assistant"):
-        status_placeholder = st.status("🔮 Agent đang phân tích...", expanded=True)
+        status_placeholder = st.status("🔮 Đang kết nối Backend...", expanded=True)
             
-        import time
-
-        def on_agent_event(event_type, data):
-            # Nếu sự kiện quá sát nhau (< 0.2s), chỉ cập nhật lén ở status_placeholder.update, không dùng st.markdown
-            current_time = time.time()
-            is_fast = (current_time - st.session_state.last_ui_update) < 0.2
-            
-            display_data = str(data)
-            if len(display_data) > 300:
-                display_data = display_data[:300] + "..."
-
-            with status_placeholder:
-                if event_type == "THINK":
-                    if not is_fast: st.markdown(f"**🤔 THINK:** _{display_data}_")
-                    status_placeholder.update(label="🤔 Đang suy nghĩ...")
-                elif event_type == "ACT":
-                    if not is_fast: st.markdown(f"🛠️ **ACT:** `{display_data}`")
-                    status_placeholder.update(label="🛠️ Đang sử dụng công cụ...")
-                elif event_type == "OBSERVE":
-                    if not is_fast: st.info(f"👁️ **OBSERVE:** {display_data}")
-                    status_placeholder.update(label="👁️ Phân tích kết quả...")
-                elif event_type == "REPAIR":
-                    st.warning(f"⚠️ **SELF-REPAIR:** {display_data}") # Lỗi thì luôn hiển thị
-                    status_placeholder.update(label="⚠️ Tự động sửa lỗi...")
-                elif event_type == "QUEUE_WAITING":
-                    # Không spam toast, chỉ update label
-                    status_placeholder.update(label=f"⏳ Đang chờ GPU (Vị trí: {display_data})...")
-            
-            st.session_state.last_ui_update = current_time
-
         final_temp = 0.0 if st.session_state.turbo_mode else st.session_state.temp_val
         final_iter = 3 if st.session_state.turbo_mode else st.session_state.iter_val
         
-        # 🟢 BẮT LỖI TẠI TẦNG UI (Ngăn sập app)
+        payload = {
+            "messages": st.session_state.messages,
+            "model": st.session_state.base_model,
+            "temperature": final_temp,
+            "max_iterations": final_iter,
+            "turbo_mode": st.session_state.turbo_mode
+        }
+
+        response_text = ""
         try:
-            response = AsyncBridge.run_agent(
-                model_name=st.session_state.base_model,
-                local_rag_instance=local_rag,
-                user_input=user_input, 
-                max_iter=final_iter,
-                temp=final_temp,
-                event_callback=on_agent_event
-            )
-            # 🟢 VÁ LỖI UX: Dọn sạch hoàn toàn hộp Status thay vì để lại cục rác
-            status_placeholder.empty() 
+            # 🟢 FIX 3: Timeout Tối ưu & Tường minh
+            timeout_config = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
             
-            st.markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+            with httpx.Client(timeout=timeout_config) as client:
+                with client.stream("POST", f"{BACKEND_URL}/chat", json=payload) as response:
+                    for line in response.iter_lines():
+                        # 🟢 FIX 1: Parsing SSE An toàn tuyệt đối (Chống rác)
+                        if not line:
+                            continue
+                            
+                        line = line.strip()
+                        
+                        # Bỏ qua Heartbeat mặc định của SSE (dòng bắt đầu bằng dấu hai chấm)
+                        if line.startswith(":"): 
+                            continue
+
+                        if not line.startswith("data:"):
+                            continue
+                            
+                        json_str = line.replace("data:", "", 1).strip()
+                        
+                        try:
+                            data = json.loads(json_str)
+                            event = data.get("event")
+                            event_data = data.get("data", "")
+                            
+                            current_time = time.time()
+                            is_fast = (current_time - st.session_state.last_ui_update) < 0.2
+                            
+                            display_data = str(event_data)
+                            if len(display_data) > 300:
+                                display_data = display_data[:300] + "..."
+
+                            with status_placeholder:
+                                if event == "FINAL_ANSWER":
+                                    response_text = event_data
+                                # 🟢 ƯU TIÊN 2: Hứng từng Token (Streaming Nâng cấp)
+                                elif event == "ANSWER_CHUNK":
+                                    response_text += event_data
+                                    # Streaming mượt mà trên UI (bạn có thể cải tiến render sau)
+                                    status_placeholder.update(label="✍️ Đang viết câu trả lời...")
+                                elif event == "THINK":
+                                    if not is_fast: st.markdown(f"**🤔 THINK:** _{display_data}_")
+                                    status_placeholder.update(label="🤔 Đang suy nghĩ...")
+                                elif event == "ACT":
+                                    if not is_fast: st.markdown(f"🛠️ **ACT:** `{display_data}`")
+                                    status_placeholder.update(label="🛠️ Đang sử dụng công cụ...")
+                                elif event == "OBSERVE":
+                                    if not is_fast: st.info(f"👁️ **OBSERVE:** {display_data}")
+                                    status_placeholder.update(label="👁️ Phân tích kết quả...")
+                                elif event == "REPAIR":
+                                    st.warning(f"⚠️ **SELF-REPAIR:** {display_data}")
+                                    status_placeholder.update(label="⚠️ Tự động sửa lỗi...")
+                                elif event == "QUEUE_WAITING":
+                                    status_placeholder.update(label=f"⏳ Đang chờ GPU (Vị trí: {display_data})...")
+                                # 🟢 FIX 2: Bắt Heartbeat từ Server để giữ UI "Sống"
+                                elif event == "PING":
+                                    status_placeholder.update(label="💓 Đang duy trì kết nối...")
+                                elif event == "ERROR":
+                                    raise Exception(event_data)
+                                    
+                            st.session_state.last_ui_update = current_time
+                            
+                        except json.JSONDecodeError:
+                            continue
+
+            status_placeholder.empty()
+            if response_text:
+                st.markdown(response_text)
+                st.session_state.messages.append({"role": "assistant", "content": response_text, "is_temp": False})
+            else:
+                raise Exception("Không nhận được kết quả cuối cùng từ server.")
             
+        except httpx.ConnectError:
+            status_placeholder.update(label="❌ Backend Server không phản hồi!", state="error", expanded=False)
+            st.error("Không thể kết nối đến AI Engine (FastAPI). Hãy chắc chắn server.py đang chạy.")
         except Exception as e:
-            error_msg = f"Hệ thống gặp sự cố nội bộ: {str(e)}"
-            # 🟢 VỚI LỖI THÌ GIỮ LẠI STATUS ĐỂ USER BIẾT
             status_placeholder.update(label="❌ Xử lý thất bại!", state="error", expanded=False)
-            st.error(error_msg)
-            st.session_state.messages.append({"role": "assistant", "content": f"⚠️ {error_msg}"})
+            st.error(f"Hệ thống gặp sự cố: {str(e)}")
 
     st.session_state.is_running = False
     st.rerun()
 
-# Raw Data Viewer nằm độc lập bên ngoài
 st.markdown("---")
 with st.expander("🔍 Raw Data Viewer (Context Research)"):
     st.json(st.session_state.messages)

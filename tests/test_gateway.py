@@ -1,6 +1,6 @@
 import asyncio
 import time
-from core.gateway import gateway_entry
+from Archive.gateway import gateway_entry
 
 # Giả lập hàm xử lý model Phi-3:mini (Chiếm khoảng 2.2GB VRAM)
 async def mock_phi3_mini(user_input, task_id, trace_id):

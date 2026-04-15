@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 import urllib.request
-from core.gateway import gateway_entry
+from Archive.gateway import gateway_entry
 
 # Cấu hình API của máy chủ Ollama chạy trên Local
 OLLAMA_URL = "http://localhost:11434/api/generate"

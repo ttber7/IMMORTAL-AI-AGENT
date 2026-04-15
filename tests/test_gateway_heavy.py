@@ -1,6 +1,6 @@
 import asyncio
 import time
-from core.gateway import gateway_entry
+from Archive.gateway import gateway_entry
 
 # Giả lập hàm xử lý model chiếm RAM thật sự!
 async def heavy_mock_llm(user_input, task_id, trace_id):
